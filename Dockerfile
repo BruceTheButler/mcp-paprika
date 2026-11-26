@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.29@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
 # ─── Stage 1: builder ────────────────────────────────────────────────────────
 # Full Debian-based Node image so corepack/pnpm and TypeScript compilation
 # have all the tools they need.
-FROM node:24.16.0-bookworm-slim AS builder
+FROM node:26.13.1-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS builder
 
 WORKDIR /app
 
@@ -22,6 +22,13 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY tsconfig.json ./
 COPY scripts/build-widgets.ts ./scripts/build-widgets.ts
 COPY src ./src
+
+# Prerelease tags bypass release-please, so package.json can lag the release.
+# Stamp the tag's version here: the runtime stage copies this package.json, and
+# telemetry reads service.version from it. Local builds keep the checked-in version.
+ARG VERSION=""
+RUN if [ -n "$VERSION" ]; then pnpm pkg set version="$VERSION"; fi
+
 RUN pnpm build
 
 # Pre-create the runtime data directory tree here, in a stage that can chown.
@@ -35,7 +42,7 @@ RUN mkdir -p /opt/data/config /opt/data/cache
 # A separate install with --prod produces a node_modules tree without dev
 # dependencies (TypeScript, vitest, oxlint, etc.) — keeps the runtime image
 # small.
-FROM node:24.16.0-bookworm-slim AS prod-deps
+FROM node:26.13.1-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS prod-deps
 
 WORKDIR /app
 RUN corepack enable
@@ -50,7 +57,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 # Distroless `nodejs24-debian13:nonroot` ships a built-in `ENTRYPOINT
 # ["/nodejs/bin/node"]` and runs as user 65532 (nonroot). We only need to
 # supply CMD args.
-FROM gcr.io/distroless/nodejs24-debian13:nonroot
+FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:675c532423b908f9e56f9d60a4e62309b63cd2a3175acb90a46b96f7ee68e121
 
 WORKDIR /app
 

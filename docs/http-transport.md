@@ -13,14 +13,14 @@ host and origin allowlists, and graceful shutdown.
 
 ## Environment variables
 
-| Variable                     | Config path            | Required | Default     | Description                                                                                    |
-| ---------------------------- | ---------------------- | -------- | ----------- | ---------------------------------------------------------------------------------------------- |
-| `MCP_HTTP_PORT`              | `http.port`            | No       | `3000`      | Port to bind when `MCP_TRANSPORT=http` (1–65535)                                               |
-| `MCP_HTTP_HOST`              | `http.host`            | No       | `"0.0.0.0"` | Host to bind when `MCP_TRANSPORT=http`                                                         |
-| `MCP_ALLOWED_HOSTS`          | `http.allowedHosts`    | No       | `[]`        | `Host`-header allowlist (DNS rebinding protection)                                             |
-| `MCP_ALLOWED_ORIGINS`        | `http.allowedOrigins`  | No       | `[]`        | `Origin`-header allowlist (browser-only; locks out CLI clients)                                |
-| `MCP_HTTP_SHUTDOWN_DRAIN_MS` | `http.shutdownDrainMs` | No       | `"5s"`      | Readiness-drain delay on `SIGTERM` (see [Graceful shutdown](#graceful-shutdown-kubernetes))    |
-| `MCP_WIDGET_PREVIEW`         | `http.widgetPreview`   | No       | `false`     | Mount the dev-only `/widget-preview` route (see [Widget preview](#widget-preview-development)) |
+| Variable                  | Required | Default     | Description                                                                                    |
+| ------------------------- | -------- | ----------- | ---------------------------------------------------------------------------------------------- |
+| `MCP_HTTP_PORT`           | No       | `3000`      | Port to bind when `MCP_TRANSPORT=http` (1–65535)                                               |
+| `MCP_HTTP_HOST`           | No       | `"0.0.0.0"` | Host to bind when `MCP_TRANSPORT=http`                                                         |
+| `MCP_ALLOWED_HOSTS`       | No       | `[]`        | `Host`-header allowlist (DNS rebinding protection)                                             |
+| `MCP_ALLOWED_ORIGINS`     | No       | `[]`        | `Origin`-header allowlist (browser-only; locks out CLI clients)                                |
+| `MCP_HTTP_SHUTDOWN_DRAIN` | No       | `"5s"`      | Readiness-drain delay on `SIGTERM` (see [Graceful shutdown](#graceful-shutdown-kubernetes))    |
+| `MCP_WIDGET_PREVIEW`      | No       | `false`     | Mount the dev-only `/widget-preview` route (see [Widget preview](#widget-preview-development)) |
 
 `MCP_HTTP_PORT` accepts a number string or a bare number, coerced to an integer in
 the range `1`–`65535`. `MCP_HTTP_HOST` accepts any non-empty string and defaults to
@@ -72,13 +72,48 @@ This is belt-and-suspenders on top of `MCP_ALLOWED_HOSTS`, not a replacement for
   the port if your clients send one (e.g. `mcp.example.com:443`).
 - Either list automatically enables enforcement. There's no separate toggle.
 
+## Sessions
+
+Each client gets a session at `initialize`, identified by the `mcp-session-id` header the
+server returns. Under OAuth, a session belongs to the subject (the OIDC `sub`) whose token
+opened it. A request that presents the session id with a token for a different subject is
+treated as if the session didn't exist, so a leaked id is useless without its owner's
+token.
+
+An unknown session id gets a `404` with a JSON-RPC error body, which tells the client to
+discard the id and initialize again:
+
+```json
+{ "jsonrpc": "2.0", "error": { "code": -32001, "message": "Session not found" }, "id": null }
+```
+
+### Surviving restarts
+
+Sessions survive a restart. At `initialize` the server writes a small record to
+`<cache dir>/sessions/<session id>.json`: the protocol version, the client's name, version,
+and capabilities, the owning subject, and two timestamps. No tokens. After a restart, a
+request with an old session id is served from a session rebuilt from that record, so the
+client never sees the `404`. Put the [cache directory](configuration.md#cache-directory) on a
+persistent volume for this to work.
+
+A record is removed when the client ends the session with `DELETE /mcp`, or once it has gone
+unused for longer than the TTL. The server keeps a bounded number of records and sweeps
+expired ones at boot and when the cap is reached. If every slot holds a session still in
+use, a new session works but won't survive a restart; the server logs
+`session record cap reached; this session won't survive a restart`. The TTL, the cap, and
+how often an active session refreshes its record are `SESSION_TTL_MS`,
+`MAX_PERSISTED_SESSIONS`, and `LAST_SEEN_REFRESH_MS` in `src/transport/session-store.ts`.
+
+One thing doesn't survive: an elicitation prompt that's open at the moment of the restart.
+The session comes back, but that tool call fails and the assistant has to retry it.
+
 ## Graceful shutdown (Kubernetes)
 
 On `SIGTERM` the server shuts down in two phases:
 
 1. **Readiness drain.** `/healthz` immediately starts returning `503`, so
    Kubernetes marks the pod not-ready and removes it from the Service endpoints,
-   and the server keeps serving for `MCP_HTTP_SHUTDOWN_DRAIN_MS` (default `5s`).
+   and the server keeps serving for `MCP_HTTP_SHUTDOWN_DRAIN` (default `5s`).
    This window lets endpoint removal and kube-proxy / ingress routing propagate, so
    a request routed just before the pod was deleted still reaches a working server
    instead of a refused connection.
@@ -90,8 +125,8 @@ On `SIGTERM` the server shuts down in two phases:
 
 Budget the timing so the **total** stays under `terminationGracePeriodSeconds`: the
 drain delay plus the `10s` drain timeout (default `5 + 10 = 15s`) must be less than
-the grace period (the chart/manifest default is `30s`). `MCP_HTTP_SHUTDOWN_DRAIN_MS`
-accepts a duration (`"5s"`) or milliseconds; `0` disables the drain delay, which is
+the grace period (the chart/manifest default is `30s`). `MCP_HTTP_SHUTDOWN_DRAIN`
+takes a duration ([format](configuration.md#duration-format)), like `"5s"`; `0` disables the drain delay, which is
 appropriate when you're not running under an orchestrator, or for a single-replica
 `Recreate` rollout where there's no other replica to route to. Keep it well under
 `terminationGracePeriodSeconds`.
@@ -106,18 +141,32 @@ and rendered in a sandboxed iframe. To iterate on a widget's UI without a host,
 set `MCP_WIDGET_PREVIEW=true` and open the built widget in a browser:
 
 ```
-GET /widget-preview?widget=<name>&payload=<url-encoded-json>
+GET /widget-preview?widget=<name>&theme=<light|dark>#payload=<url-encoded-json>
 ```
 
 The route is **off by default and absent in production** — it is mounted only when
 the flag is set, before the auth block, so it is unauthenticated and exists purely
 for local development. It serves the same HTML the `ui://` resource does, but
 resolves the widget's ext-apps import to a fake host shim module instead of the
-real vendor (ADR-0025): the shim feeds `?payload=` to the widget's `ontoolresult`
-so you see it render, and logs the messages the widget would send back. `?payload=`
-is read client-side by the shim and never reflected into the HTML by the server.
-Run `pnpm build:widgets` (or `pnpm dev:widgets` to rebuild on change) first so
+real vendor (ADR-0025): the shim parses the payload into a per-page mini-store,
+feeds it to the widget's `ontoolresult` so you see it render, and answers the
+widget's own `callServerTool` calls from that store. A mark, clear, add, or
+move-to-pantry mutates the store in place, so the widget's own re-read reflects
+the action, and `?elicitation=1` pops a native `confirm()` in place of the host's
+confirmation dialog. `?touch=1` reports a touch host in `getHostContext()`, so
+swipe-only affordances render. The payload rides the URL **fragment**
+(`#payload=`), which the browser never sends in the HTTP request, so a large
+stress-test payload can't hit Node's request-header size limit. The shim reads it
+client-side and the server never reflects it into the HTML. `?payload=` remains a
+size-bounded fallback for small hand-typed payloads. Run `pnpm build:widgets` (or `pnpm dev:widgets` to rebuild on change) first so
 there is something to preview.
+
+`pnpm dev:preview` serves the same route without the rest of the server. It
+mounts only the preview router (`scripts/widget-preview.ts`), so it needs no
+Paprika credentials and no OAuth configuration; `pnpm dev` signs in to Paprika at
+startup and exits without credentials. Its index at `http://127.0.0.1:8899/`
+(`PORT` overrides the port) links every widget state it has a sample payload for
+(populated, empty, error, and data variants) in light and dark themes.
 
 ## Widget vendor runtime
 

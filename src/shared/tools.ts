@@ -17,9 +17,8 @@ import { confirmGate, pickOne } from "./elicit.js";
  */
 export type TypedCallToolResult<O extends Record<string, unknown> | void> =
   O extends Record<string, unknown>
-    ?
-        | { content: CallToolResult["content"]; structuredContent: O }
-        | { content: CallToolResult["content"]; isError: true }
+    ? | { content: CallToolResult["content"]; structuredContent: O }
+      | { content: CallToolResult["content"]; isError: true }
     : CallToolResult;
 
 /**
@@ -32,6 +31,32 @@ export type TypedCallToolResult<O extends Record<string, unknown> | void> =
  * carries this type, not the broad `CallToolResult`, for the same reason.
  */
 export type ErrorResult = { content: [{ type: "text"; text: string }]; isError: true };
+
+/**
+ * An integer schema for a tool's input or output, with optional inclusive bounds.
+ *
+ * zod 4 publishes every `.int()` with `minimum`/`maximum` of ±(2^53 - 1) in the
+ * tool's JSON Schema. Those numbers cost tokens on every `tools/list` and tell the
+ * agent nothing, so this publishes only the bounds passed here. Validation still
+ * rejects non-integers and values outside the given bounds.
+ *
+ * Pass bounds as arguments, not as chained `.min()`/`.max()` calls. The implicit
+ * bounds are cleared with `.meta()`, which overrides any bound chained after it.
+ * `test/conformance/published-int-bounds.test.ts` fails on any implicit bound.
+ *
+ * @example
+ * integer({ min: 0 }) // a count: publishes `{ type: "integer", minimum: 0 }`
+ * integer({ min: 1, max: 50 }) // a page size
+ */
+export function integer(bounds: { readonly min?: number; readonly max?: number } = {}) {
+  const { min, max } = bounds;
+  const lower = min === undefined ? z.number().int() : z.number().int().min(min);
+  const bounded = max === undefined ? lower : lower.max(max);
+  return bounded.meta({
+    ...(min === undefined && { minimum: undefined }),
+    ...(max === undefined && { maximum: undefined }),
+  });
+}
 
 /**
  * The MCP wire envelope every tool returns. The one-argument form carries only
@@ -231,7 +256,7 @@ export function commitFailure(
  * natural phrasing is "Ingredient name fuzzy match", not "Pantry item ingredient
  * fuzzy match").
  */
-export function uidOrTextLookupSchema<UidSchema extends z.ZodTypeAny, TextKey extends string>(config: {
+export function uidOrTextLookupSchema<UidSchema extends z.ZodType, TextKey extends string>(config: {
   readonly uidSchema: UidSchema;
   readonly textKey: TextKey;
   readonly entityLabel: string;

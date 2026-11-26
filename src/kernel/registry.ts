@@ -1,20 +1,23 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { context, SpanStatusCode, trace, ValueType } from "@opentelemetry/api";
-import { ResultAsync } from "neverthrow";
+import { context, trace } from "@opentelemetry/api";
+import { okAsync, ResultAsync } from "neverthrow";
 import type { Logger } from "pino";
 
 import type { CacheError } from "../cache/disk-cache.js";
 import type { GeneratedImageStore } from "../features/generated-image-store.js";
 import type { PaprikaClient } from "../paprika/client.js";
-import type { AnySyncResult, SyncError } from "../paprika/sync-types.js";
 import type { IndexEventEmitter } from "../server/index-events.js";
 import type { Notifier } from "../server/notifier.js";
 import type { PaprikaConfig } from "../utils/config.js";
 import type { ResourceDef, ResourceSpec } from "./resource.js";
+import type { ErasedSync, SyncContribution, SyncCycle, SyncTrigger } from "./sync.js";
 import type { ToolDef, ToolSpec } from "./tool.js";
 
-import { getMeter, getTracer, lazy, startTimer } from "../telemetry/scope.js";
-import { errorTypeName, startOperation, tracePromise, traceResultAsync } from "../telemetry/trace-result.js";
+import { getTracer } from "../telemetry/scope.js";
+import { errorTypeName, startOperation, tracePromise } from "../telemetry/trace-result.js";
+import { unwrapAtBoot } from "../utils/errors.js";
+import { createLazySync, type ToolAccess } from "./lazy-sync.js";
+import { buildSyncDriver } from "./sync.js";
 
 /**
  * The domain-isolation composition kernel.
@@ -36,12 +39,9 @@ import { errorTypeName, startOperation, tracePromise, traceResultAsync } from ".
  * checked.
  *
  * `dependsOn` is the single source of truth — its element union is the tools' and
- * hooks' `deps`. A boot pipeline ({@link BootPhase}) sequences side-effects the
- * construction topo-sort cannot express. The sync seam follows the same shape:
- * each module contributes a `reconcile` per owned entity, reached through the same
- * {@link BootCtx}, and the kernel drives them — so a central sync needs no
- * global slice over the modules' hidden stores. See {@link SyncContribution} and
- * {@link buildKernel}.
+ * hooks' `deps`. A post-sync boot hook ({@link ModuleParts.onIndexReady}) sequences
+ * side-effects the construction topo-sort cannot express. Each module contributes a
+ * {@link SyncContribution} per owned entity; the sync driver in `./sync.ts` runs them.
  */
 
 /**
@@ -92,6 +92,8 @@ export interface HasSynced {
  * a shared cache root — each module builds its own `DiskCache` under it.
  */
 export interface Infra {
+  /** Present only in lazy mode; tool wrappers acquire it before readiness guards. */
+  readonly toolAccess?: ToolAccess | undefined;
   readonly client: PaprikaClient;
   readonly cacheDir: string;
   readonly notifier: Notifier;
@@ -100,7 +102,7 @@ export interface Infra {
   readonly config: PaprikaConfig;
   /**
    * The recipe/category → discover re-index seam: recipe writes and the category
-   * reconcile emit here, and discover's `index` boot hook subscribes. Carried on
+   * reconcile emit here, and discover's `onIndexReady` hook subscribes. Carried on
    * `infra` because there is no dependency edge into discover (its contract is
    * empty by design). See {@link IndexEventEmitter}.
    */
@@ -118,7 +120,7 @@ export interface Infra {
 /**
  * The process-wide context a boot hook receives: the module's own internals
  * (`state`), exactly its declared dependencies' contracts (`deps`), and `infra`.
- * No `server` — boot phases run once per process, before any session exists.
+ * No `server` — boot-time code runs once per process, before any session exists.
  */
 export interface BootCtx<State, Deps extends DomainId> {
   readonly state: State;
@@ -142,60 +144,16 @@ export interface DomainCtx<State, Deps extends DomainId, Writes = Record<never, 
   readonly writes: Writes;
 }
 
-// Post-sync boot hooks. Construction order (topo-sort) handles "built before";
-// the INITIAL sync cycle (the driver below) runs next; THEN these hooks run — so
-// e.g. the vector index builds against already-synced stores. Sync is the driver,
-// not a hook, so the only post-sync phase is `index`; the array keeps the loop
-// shape for future phases.
-export type BootPhase = "index";
-const BOOT_PHASES: ReadonlyArray<BootPhase> = ["index"];
-type BootHooks<State, Deps extends DomainId> = Partial<Record<BootPhase, (ctx: BootCtx<State, Deps>) => Promise<void>>>;
-
-/**
- * Sync tier — three buckets the driver runs in order each cycle: reference → core →
- * additive. Tiers scope abort-blast-radius, NOT data ordering: nothing reads a sibling
- * store during reconcile (every catalog name resolves at read time), so a tier only
- * decides which reconciles a failure may take down. See docs/adr/0010-reference-sync-tier.md.
- *
- * - `reference` (the lookup catalogs: aisle, category, meal-type) runs FIRST, each
- *   best-effort: an `err` is logged and the cycle continues, degrading to the
- *   last-good in-memory catalog rather than aborting the primary data sync.
- * - `core` (recipe, pantry, grocery) runs next, in dependency order; a core `err`
- *   aborts the cycle as a logged no-op, mirroring the sync loop's never-throws
- *   contract (reworked from throw-abort to Result-abort).
- * - `additive` (meals, menus, photos) runs last, each best-effort, so a soft read
- *   surface can't abort core sync.
- */
-export type SyncTier = "reference" | "core" | "additive";
-
-/**
- * One entity's contribution to the sync cycle — the seam between a central sync
- * and module-owned (hidden) stores. A multi-entity domain supplies one per owned
- * entity via `syncs`. `reconcile` receives the SAME {@link BootCtx} the boot hooks
- * do: its own store/cache via `state`, its declared deps' contracts via `deps`, the
- * Paprika client via `infra.client`. So no central all-stores context is needed. It
- * resolves to an `AnySyncResult` to be emitted as `sync:complete` (recipes/grocery/
- * menus), or `void` for reference/soft entities that emit nothing; an `err` is the
- * abort signal the driver scopes by tier — a reconcile never
- * throws. `sweep` is the per-store pending-write TTL sweep the driver runs once at
- * end-of-cycle.
- */
-export interface SyncContribution<State, Deps extends DomainId> {
-  readonly tier: SyncTier;
-  reconcile(ctx: BootCtx<State, Deps>): ResultAsync<AnySyncResult | void, SyncError>;
-  sweep?(): number;
-}
-
-/** Kernel-facing erased sync contribution (the `State`/`Deps` generics gone). */
-interface ErasedSync {
-  readonly tier: SyncTier;
-  reconcile(ctx: ErasedBootCtx): ResultAsync<AnySyncResult | void, SyncError>;
-  sweep?(): number;
-}
+// Post-sync boot hook (see ModuleParts.onIndexReady below). Construction order
+// (topo-sort) handles "built before"; the INITIAL sync cycle (the driver in
+// ./sync.ts) runs next; THEN this hook runs — so e.g. the vector index builds against
+// already-synced stores. Sync is the driver, not a hook. One hook, one consumer
+// (discover) — reintroduce a phase array only when a second post-sync phase
+// actually exists.
 
 /**
  * What a module's `.build((state, infra, deps) => …)` callback returns. `api` must satisfy
- * the contract the module registered for its own id; `tools`/`resources`/`onReady`
+ * the contract the module registered for its own id; `tools`/`resources`/`onIndexReady`
  * get a ctx narrowed to `State` + the `dependsOn` tuple — INFERRED, so the author
  * writes no per-module ctx alias; `flush` is optional.
  *
@@ -208,8 +166,9 @@ interface ErasedSync {
  * `resources` is parallel to `tools`: each entry is a `defineResource` {@link ResourceDef}
  * the kernel registers via `resource.register(ctx)`, reading its own data via
  * `ctx.state` and any shared data via `ctx.deps.<id>` contracts. Resources are
- * read-only (Content domains only — recipe, grocery-list, menu — plus the widgets
- * feature), so they never touch `ctx.writes` and most modules supply none.
+ * read-only (the recipe photo proxy and the widgets feature — both `ui://`; ADR-0026
+ * removed the `paprika://` content resources), so they never touch `ctx.writes` and
+ * most modules supply none.
  */
 export interface ModuleParts<Id extends DomainId, Deps extends DomainId, State, Writes = Record<never, never>> {
   readonly api: DomainRegistry[Id];
@@ -217,12 +176,14 @@ export interface ModuleParts<Id extends DomainId, Deps extends DomainId, State, 
   readonly writes?: Writes;
   readonly resources?: ReadonlyArray<ResourceDef<State, Deps>>;
   readonly syncs?: ReadonlyArray<SyncContribution<State, Deps>>;
-  readonly onReady?: BootHooks<State, Deps>;
+  /** Runs once, after the initial sync cycle (see the boot-hook note above `ModuleParts`). */
+  readonly onIndexReady?: (ctx: BootCtx<State, Deps>) => Promise<void>;
+  readonly reload?: () => ResultAsync<void, CacheError>;
   readonly flush?: () => ResultAsync<void, CacheError>;
 }
 
 /** Kernel-facing erased contexts (the `DomainCtx`/`BootCtx` generics gone). */
-interface ErasedBootCtx {
+export interface ErasedBootCtx {
   readonly state: unknown;
   readonly deps: Record<string, unknown>;
   readonly infra: Infra;
@@ -251,7 +212,8 @@ interface ErasedBuild {
   readonly tools: ReadonlyArray<ErasedToolDef>;
   readonly resources?: ReadonlyArray<ErasedResourceDef>;
   readonly syncs?: ReadonlyArray<ErasedSync>;
-  readonly onReady?: Partial<Record<BootPhase, (ctx: ErasedBootCtx) => Promise<void>>>;
+  readonly onIndexReady?: (ctx: ErasedBootCtx) => Promise<void>;
+  readonly reload?: () => ResultAsync<void, CacheError>;
   readonly flush?: () => ResultAsync<void, CacheError>;
 }
 
@@ -325,7 +287,8 @@ export function defineModule<Id extends DomainId, const DepList extends Readonly
             tools: parts.tools,
             resources: parts.resources,
             syncs: parts.syncs,
-            onReady: parts.onReady,
+            onIndexReady: parts.onIndexReady,
+            reload: parts.reload,
             flush: parts.flush,
           };
         },
@@ -378,58 +341,21 @@ export interface Kernel {
   /** Flush every module that owns a cache — only if a snapshot is wanted. */
   flushAll(): ResultAsync<void, CacheError>;
   /**
-   * Run ONE sync cycle: reference catalogs first (best-effort), then core (recipe
-   * first, then the rest in dependency order; a core `err` aborts), then additive
-   * best-effort, then flush + sweep. Never throws.
-   * Returns the results a production wiring emits as `sync:complete` (feeding the
-   * notifier subscriber) — but ONLY for a cycle that completed through flush; an
-   * aborted cycle (a core `err` or a flush error) returns `[]`, so a partial,
-   * un-flushed cycle fans out no resource notification. The initial cycle already
-   * ran at build time (gating the
-   * post-sync hooks); the interval driver calls this on its loop.
+   * Run ONE sync cycle (tiered reconciles, then flush + sweep; see
+   * {@link buildSyncDriver}). Never throws.
+   * Returns the cycle's `outcome` plus its per-entity change results, which feed the
+   * change-count metrics. Results come back ONLY for a cycle that completed through
+   * flush; an aborted cycle (a core `err` or a flush error) returns `[]`, so a partial,
+   * un-flushed cycle counts no changes. The interval driver reads `outcome` to pace its
+   * next cycle (`core_partial` retries sooner). The initial cycle already ran at build
+   * time (gating the post-sync hooks); the interval driver calls this on its loop.
    *
    * `trigger` only labels telemetry (the cycle span + duration histogram);
    * behavior is identical. buildKernel's internal initial call passes "boot";
    * every external caller is the interval path and takes the default.
    */
-  syncOnce(trigger?: SyncTrigger): Promise<ReadonlyArray<AnySyncResult>>;
+  syncOnce(trigger?: SyncTrigger): Promise<SyncCycle>;
 }
-
-/** What started a sync cycle — a telemetry label, not a behavioral input. */
-export type SyncTrigger = "boot" | "interval";
-
-/** How a sync cycle ended, as recorded on its span and duration histogram. */
-type SyncOutcome = "ok" | "core_aborted" | "flush_failed" | "contract_breach";
-
-const ATTR_SYNC_TRIGGER = "mcp_paprika.sync.trigger";
-const ATTR_SYNC_OUTCOME = "mcp_paprika.sync.outcome";
-const ATTR_SYNC_TIER = "mcp_paprika.sync.tier";
-const ATTR_SYNC_DOMAIN = "mcp_paprika.sync.domain";
-const ATTR_SYNC_ENTITY = "mcp_paprika.sync.entity";
-const ATTR_SYNC_CHANGE_KIND = "mcp_paprika.sync.change.kind";
-
-const syncCycleDuration = lazy(() =>
-  getMeter().createHistogram("mcp_paprika.sync.cycle.duration", {
-    description: "Duration of sync cycles, by trigger and outcome",
-    unit: "s",
-    valueType: ValueType.DOUBLE,
-  }),
-);
-const syncChanges = lazy(() =>
-  getMeter().createCounter("mcp_paprika.sync.changes", {
-    description: "Entity changes applied by sync cycles that completed through flush",
-    unit: "{change}",
-  }),
-);
-const syncSweepExpired = lazy(() =>
-  getMeter().createCounter("mcp_paprika.sync.sweep.expired", {
-    description: "Pending-write marks expired by the end-of-cycle TTL sweep",
-    unit: "{mark}",
-  }),
-);
-
-/** `error.type` class for a reconcile failure: the error's constructor, or the plain-object CacheError. */
-const syncErrorType = (error: SyncError): string => errorTypeName(error, "CacheError");
 
 interface Built {
   readonly id: string;
@@ -439,20 +365,29 @@ interface Built {
   readonly tools: ReadonlyArray<ErasedToolDef>;
   readonly resources: ReadonlyArray<ErasedResourceDef> | undefined;
   readonly syncs: ReadonlyArray<ErasedSync> | undefined;
-  readonly onReady: Partial<Record<BootPhase, (ctx: ErasedBootCtx) => Promise<void>>> | undefined;
+  readonly onIndexReady: ((ctx: ErasedBootCtx) => Promise<void>) | undefined;
+  readonly reload: (() => ResultAsync<void, CacheError>) | undefined;
 }
 
 /**
  * Build the kernel: (0) construct every module in dependency order — each `.state`
  * factory hydrates its own cache, so "all built" ⇒ "all caches warm"; then (1) run
- * the initial sync cycle; then (2) run the boot phases in order, each to completion
- * before the next. Returns a per-session registrar. Defaults to the self-registered
- * modules.
+ * the initial sync cycle; then (2) run every module's `onIndexReady` hook. Returns
+ * a per-session registrar. Defaults to the self-registered modules.
  */
 export async function buildKernel(
-  infra: Infra,
+  sourceInfra: Infra,
   modules: ReadonlyArray<ErasedModule> = registeredModules(),
 ): Promise<Kernel> {
+  // The runtime-only gate is shared by all sessions on this kernel.
+  let access: ToolAccess | undefined;
+  const infra: Infra = {
+    ...sourceInfra,
+    get toolAccess() {
+      return access;
+    },
+  };
+  const lazy = infra.config.sync.mode === "lazy";
   const order = topoSort(modules);
   const apis = new Map<string, unknown>();
   const built: Array<Built> = [];
@@ -466,8 +401,8 @@ export async function buildKernel(
   const bootCtxOf = (b: Built): ErasedBootCtx => ({ state: b.state, deps: depsOf(b.dependsOn), infra });
 
   // The boot trace: one root span covering construction → initial sync →
-  // boot phases (the cycle and reconcile spans parent under it via the active
-  // context), with a child per module build. Boot is the one place per-module
+  // the onIndexReady hook (the cycle and reconcile spans parent under it via the
+  // active context), with a child per module build. Boot is the one place per-module
   // timing matters — every .state factory hydrates its disk caches serially in
   // dependency order, so a slow startup names its culprit here. A build or
   // hook that throws (boot fail-fast) ends the open spans
@@ -485,231 +420,73 @@ export async function buildKernel(
   };
 
   // Phase 0 — construction (+ per-module cache hydration).
-  await inBoot(async () => {
-    for (const m of order) {
-      // async wrapper: ErasedModule.build may return a plain value or a promise.
-      const b = await tracePromise(getTracer(), `boot.build_module ${m.id}`, {}, async () =>
-        m.build(infra, depsOf(m.dependsOn)),
-      );
-      apis.set(m.id, b.api);
-      if (b.flush !== undefined) flushers.push(b.flush);
-      built.push({
-        id: m.id,
-        dependsOn: m.dependsOn,
-        state: b.state,
-        writes: b.writes,
-        tools: b.tools,
-        resources: b.resources,
-        syncs: b.syncs,
-        onReady: b.onReady,
-      });
-    }
-  });
+  const construct = () =>
+    inBoot(async () => {
+      for (const m of order) {
+        // async wrapper: ErasedModule.build may return a plain value or a promise.
+        const b = await tracePromise(getTracer(), `boot.build_module ${m.id}`, {}, async () =>
+          m.build(infra, depsOf(m.dependsOn)),
+        );
+        apis.set(m.id, b.api);
+        if (b.flush !== undefined) flushers.push(b.flush);
+        built.push({
+          id: m.id,
+          dependsOn: m.dependsOn,
+          state: b.state,
+          writes: b.writes,
+          tools: b.tools,
+          resources: b.resources,
+          syncs: b.syncs,
+          onIndexReady: b.onIndexReady,
+          reload: b.reload,
+        });
+      }
+    });
+
+  if (lazy) {
+    access = createLazySync({
+      cacheDir: infra.cacheDir,
+      account: infra.config.paprika.email,
+      maxAgeMs: infra.config.sync.interval,
+      writeGraceMs: infra.config.sync.pendingWriteTtl,
+      reload: () =>
+        ResultAsync.combine(built.flatMap((b) => (b.reload === undefined ? [] : [b.reload()]))).map(() => undefined),
+      authenticate: () => infra.client.authenticate(),
+      sync: () => syncOnce("tool"),
+      ready: () => ready(),
+    });
+    // Hydration itself must not race an active writer deleting/renaming records.
+    unwrapAtBoot(await access.run(construct, true, false), "shared cache construction");
+  } else {
+    await construct();
+  }
 
   const flushAll = (): ResultAsync<void, CacheError> =>
     ResultAsync.combine(flushers.map((f) => f())).map(() => undefined);
 
-  // The sync DRIVER (seam: central sync ↔ module-owned stores). The engine is a
-  // dumb sequencer — each entity's reconcile lives in its module, reached through
-  // the BootCtx (its own store/cache + declared deps + the client). Three tiers run
-  // in order: reference catalogs first (best-effort), then core in dependency order
-  // (a failure aborts the cycle), then additive best-effort; then flush + sweep. The
-  // whole cycle never throws. Tiers scope abort-blast-radius, not data ordering —
-  // nothing reads a sibling store during reconcile.
-  //
-  // Recipe's core reconciles must LEAD the core tier: recipe must be marked synced
-  // before the other core reconciles (pantry, grocery) run, so a later core failure
-  // can't gate recipe tools for the interval. Recipe is dep-free, so the topo-sort
-  // (which orders aisle→pantry→grocery via their dependency edges) can't hoist it — a
-  // stable sort keyed on id "recipe" does. This is the one ordering the dependency DAG
-  // can't express; if a second priority case ever appears, promote it to a declared
-  // `SyncContribution` ordinal (copy first, abstract on the third).
-  const syncOrder = [...built].sort((a, z) => (a.id === "recipe" ? -1 : 0) - (z.id === "recipe" ? -1 : 0));
-  type RunSync = () => ResultAsync<AnySyncResult | void, SyncError>;
-  const referenceSyncs: Array<RunSync> = [];
-  const coreSyncs: Array<RunSync> = [];
-  const additiveSyncs: Array<RunSync> = [];
-  const sweepers: Array<() => number> = [];
-  for (const b of syncOrder) {
-    if (b.syncs === undefined) continue;
-    for (const sync of b.syncs) {
-      // Each reconcile runs under its own span (named by owning domain — a
-      // domain with several syncs shares the name; the entity attribute
-      // stamped from the result disambiguates), child of the cycle span via
-      // the active context. error.type carries the typed failure's class.
-      const run: RunSync = () =>
-        traceResultAsync(
-          getTracer(),
-          `paprika.sync.reconcile ${b.id}`,
-          { attributes: { [ATTR_SYNC_TIER]: sync.tier, [ATTR_SYNC_DOMAIN]: b.id }, errorType: syncErrorType },
-          () =>
-            sync.reconcile(bootCtxOf(b)).map((result) => {
-              // The reconcile span is the active span here (traceResultAsync
-              // runs fn under it); stamp what the reconcile produced.
-              if (result !== undefined) {
-                trace.getActiveSpan()?.setAttributes({
-                  [ATTR_SYNC_ENTITY]: result.changeType,
-                  "mcp_paprika.sync.added": result.changes.added.length,
-                  "mcp_paprika.sync.updated": result.changes.updated.length,
-                  "mcp_paprika.sync.removed": result.changes.removedUids.length,
-                });
-              }
-              return result;
-            }),
-        );
-      if (sync.tier === "reference") referenceSyncs.push(run);
-      else if (sync.tier === "core") coreSyncs.push(run);
-      else additiveSyncs.push(run);
-      if (sync.sweep !== undefined) sweepers.push(sync.sweep);
-    }
-  }
-  const syncOnce = async (trigger: SyncTrigger = "interval"): Promise<ReadonlyArray<AnySyncResult>> => {
-    // The cycle span parents every reconcile span (and their undici fetch
-    // children) via the active context; `finish` is the single end point that
-    // stamps the outcome, records the duration histogram, and — only for a
-    // cycle that completed through flush — counts the applied changes. The
-    // change counters mirror the results contract: an aborted cycle reports
-    // none, exactly as it fans out no notification.
-    const cycleSpan = getTracer().startSpan("paprika.sync_cycle", { attributes: { [ATTR_SYNC_TRIGGER]: trigger } });
-    const cycleElapsedSeconds = startTimer();
-    const finish = (outcome: SyncOutcome, results: ReadonlyArray<AnySyncResult>): ReadonlyArray<AnySyncResult> => {
-      const elapsedSeconds = cycleElapsedSeconds();
-      cycleSpan.setAttribute(ATTR_SYNC_OUTCOME, outcome);
-      if (outcome !== "ok") cycleSpan.setStatus({ code: SpanStatusCode.ERROR });
-      cycleSpan.end();
-      syncCycleDuration().record(elapsedSeconds, {
-        [ATTR_SYNC_TRIGGER]: trigger,
-        [ATTR_SYNC_OUTCOME]: outcome,
-      });
-      let total = 0;
-      const entitiesChanged: string[] = [];
-      for (const r of results) {
-        const counts = [
-          ["added", r.changes.added.length],
-          ["updated", r.changes.updated.length],
-          ["removed", r.changes.removedUids.length],
-        ] as const;
-        let entityTotal = 0;
-        for (const [kind, n] of counts) {
-          if (n > 0) syncChanges().add(n, { [ATTR_SYNC_ENTITY]: r.changeType, [ATTR_SYNC_CHANGE_KIND]: kind });
-          entityTotal += n;
-        }
-        total += entityTotal;
-        if (entityTotal > 0) entitiesChanged.push(r.changeType);
-      }
-      // Close every cycle with a summary line (the interval loop is otherwise
-      // silent on success): a change-bearing cycle at info, a clean no-op at
-      // debug. The aborted outcomes already logged their err/warn above, so they
-      // close at debug here without a second error line. Trace correlation via the
-      // span; per-entity counts live on the sync_changes metric.
-      const fields = {
-        trigger,
-        outcome,
-        durationSec: Math.round(elapsedSeconds),
-        changes: total,
-        entities: entitiesChanged,
-      };
-      if (outcome === "ok" && total > 0) {
-        infra.log.info(fields, "sync cycle complete");
-      } else {
-        infra.log.debug(fields, "sync cycle complete");
-      }
-      return results;
-    };
-    return context.with(trace.setSpan(context.active(), cycleSpan), async () => {
-      const results: Array<AnySyncResult> = [];
-      // The reconciles speak Result, so the abort seam is the core-tier
-      // `err` below, not a catch. The try/catch is pure defense-in-depth for a
-      // reconcile that breaks its own contract (a throw inside a chain callback
-      // rejects the underlying promise): syncOnce's never-throws promise is
-      // load-bearing for the interval loop and boot.
-      try {
-        // Reference catalogs first, best-effort: a catalog fetch failure degrades to the
-        // last-good in-memory catalog (consumers resolve names at read time and gate on
-        // hasSynced) rather than aborting the primary data sync below.
-        for (const run of referenceSyncs) {
-          (await run()).match(
-            (r) => {
-              if (r !== undefined) results.push(r);
-            },
-            (err) => {
-              infra.log.warn({ err }, "reference sync failed; core sync unaffected");
-            },
-          );
-        }
-        for (const run of coreSyncs) {
-          const coreErr = (await run()).match(
-            (r) => {
-              if (r !== undefined) results.push(r);
-              return undefined;
-            },
-            (err) => err,
-          );
-          if (coreErr !== undefined) {
-            // A core err aborts the cycle: no flush, no sweep, no results — the
-            // partially reconciled state stays in memory and the next cycle retries.
-            infra.log.error({ err: coreErr }, "sync failed");
-            return finish("core_aborted", []);
-          }
-        }
-        for (const run of additiveSyncs) {
-          (await run()).match(
-            (r) => {
-              if (r !== undefined) results.push(r);
-            },
-            (err) => {
-              infra.log.warn({ err }, "additive sync failed; core sync unaffected");
-            },
-          );
-        }
-        // Only a cycle that reached flush reports results: a core-reconcile err (or
-        // a flush error) aborts the cycle. Returning the partially accumulated
-        // `results` for an aborted, un-flushed cycle would fan out a resource
-        // notification for state that never became durable — return `[]` instead.
-        return (await flushAll()).match(
-          () => {
-            let swept = 0;
-            for (const sweep of sweepers) swept += sweep();
-            if (swept > 0) {
-              infra.log.debug({ swept }, "swept pending writes past TTL");
-              syncSweepExpired().add(swept);
-            }
-            return finish("ok", results);
-          },
-          (flushErr) => {
-            infra.log.error({ err: flushErr }, "sync flush failed");
-            return finish("flush_failed", []);
-          },
-        );
-      } catch (err) {
-        infra.log.error({ err }, "sync failed (reconcile broke the Result contract)");
-        return finish("contract_breach", []);
+  const syncOnce = buildSyncDriver({
+    modules: built.map((b) => ({ id: b.id, syncs: b.syncs, ctx: () => bootCtxOf(b) })),
+    flushAll,
+    log: infra.log.child({ component: "sync" }),
+  });
+
+  let indexReady = false;
+  const ready = async (): Promise<void> => {
+    if (indexReady) return;
+    await tracePromise(getTracer(), "boot.phase index", {}, async () => {
+      for (const b of built) {
+        if (b.onIndexReady !== undefined) await b.onIndexReady(bootCtxOf(b));
       }
     });
+    indexReady = true;
   };
-
-  // Boot: construct → run the INITIAL sync cycle → run post-sync hooks. The initial
-  // cycle gates the hooks, so e.g. the vector `index` builds against already-synced
-  // stores. The interval loop just calls `syncOnce` repeatedly. The startup breadcrumb
-  // (#158) brackets the cycle: a failure logs `sync failed` (error) from the catch above.
-  infra.log.info("running initial sync");
-  // The initial cycle's results are intentionally discarded: at this point no server /
-  // session exists (stdio's ServerRef is unset; HTTP has zero sessions), so a resource
-  // notification would no-op. The interval
-  // driver's immediate first iteration re-syncs and DOES call notifyFromResults once a
-  // session can receive it. If the bootstrap order ever changes so a server exists here,
-  // wire notifyFromResults onto this call too.
-  await inBoot(async () => {
-    await syncOnce("boot");
-    for (const phase of BOOT_PHASES) {
-      await tracePromise(getTracer(), `boot.phase ${phase}`, {}, async () => {
-        for (const b of built) {
-          const hook = b.onReady?.[phase];
-          if (hook !== undefined) await hook(bootCtxOf(b));
-        }
-      });
-    }
-  });
+  if (!lazy) {
+    infra.log.info("running initial sync");
+    await inBoot(async () => {
+      await syncOnce("boot");
+      await ready();
+    });
+  }
   bootOp.end();
 
   return {
@@ -722,7 +499,17 @@ export async function buildKernel(
         if (b.resources !== undefined) for (const resource of b.resources) resource.register(ctx);
       }
     },
-    flushAll,
-    syncOnce,
+    // Lazy operations flush while holding their lease. A shutdown/diagnostic
+    // empty flush must never rewrite a stale process's recipe hash index.
+    flushAll: lazy ? () => okAsync(undefined) : flushAll,
+    syncOnce: lazy
+      ? async () => {
+          const result = await access!.run(() => undefined, true);
+          return result.match(
+            () => ({ outcome: "ok" as const, results: [] }),
+            () => ({ outcome: "core_aborted" as const, results: [] }),
+          );
+        }
+      : syncOnce,
   };
 }

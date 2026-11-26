@@ -8,6 +8,7 @@
   import Toast from "../shared/Toast.svelte";
   import WidgetShell from "../shared/WidgetShell.svelte";
   import { groupConsecutive } from "../shared/group.js";
+  import { viewTransition } from "../shared/view-transition.js";
   import {
     blobDataUri,
     callTool,
@@ -257,28 +258,45 @@
   const key = (stepIdx: number, ref: number): string =>
     `${stepIdx.toString()}:${ref.toString()}`;
 
+  // View-Transition-wrapped screen navigation: the cook flow MORPHS between screens instead of
+  // hard-swapping — the header, footer, and progress bar hold their place (their own
+  // view-transition-names) while the screen body slides directionally. `dir` sets the slide via a
+  // root data-attr the global `::view-transition` rules key on. Gated: it degrades to an instant
+  // mutation where the API is missing OR the user prefers reduced motion. `dir` drives the slide via the `data-cook-vt` root attr the shared helper
+  // sets for the transition's duration; the gate, `tick()` flush, and attr cleanup live in
+  // `shared/view-transition.ts` (shared with the recipe-browser's browse ↔ detail morph).
+  function nav(update: () => void, dir: "fwd" | "back" = "fwd"): void {
+    viewTransition(update, ["cookVt", dir]);
+  }
+
   function startCooking() {
-    mode = "cook";
-    cookPhase = "prep";
-    stepPos = 0;
+    nav(() => {
+      mode = "cook";
+      cookPhase = "prep";
+      stepPos = 0;
+    });
   }
 
   // Leave the prep screen for the first cook step (or straight to the done screen for a
   // no-cook assembly, where cookCount is 0).
   function beginSteps() {
-    cookPhase = "steps";
-    stepPos = 0;
+    nav(() => {
+      cookPhase = "steps";
+      stepPos = 0;
+    });
   }
 
   // Return to the stepper from the done screen — its last cook step, or the prep screen
   // when there are no cook steps at all.
   function backToSteps() {
-    if (cookCount === 0) {
-      cookPhase = "prep";
-      return;
-    }
-    cookPhase = "steps";
-    stepPos = cookCount - 1;
+    nav(() => {
+      if (cookCount === 0) {
+        cookPhase = "prep";
+      } else {
+        cookPhase = "steps";
+        stepPos = cookCount - 1;
+      }
+    }, "back");
   }
 
   function togglePrep(k: string) {
@@ -302,16 +320,20 @@
     if (gi === undefined || !data) return;
     if (mode === "cook") {
       // A producer on the prep screen (a made-ahead sub-component) sends the cook to prep;
-      // otherwise map its global index to the cook stepper's position.
-      if (data.steps[gi]?.phase === "prep") {
-        cookPhase = "prep";
-      } else {
-        const pos = cookSteps.findIndex((c) => c.gi === gi);
-        if (pos >= 0) {
-          cookPhase = "steps";
-          stepPos = pos;
+      // otherwise map its global index to the cook stepper's position. Read the phase before the
+      // transition closure so `data` stays narrowed non-null.
+      const producerPhase = data.steps[gi]?.phase;
+      nav(() => {
+        if (producerPhase === "prep") {
+          cookPhase = "prep";
+        } else {
+          const pos = cookSteps.findIndex((c) => c.gi === gi);
+          if (pos >= 0) {
+            cookPhase = "steps";
+            stepPos = pos;
+          }
         }
-      }
+      }, "back");
     } else {
       stepEls[gi]?.scrollIntoView({
         behavior: reduced ? "auto" : "smooth",
@@ -411,14 +433,22 @@
           class="tab"
           class:on={mode === "review"}
           aria-pressed={mode === "review"}
-          onclick={() => (mode = "review")}>Review</button
+          onclick={() => {
+            if (mode !== "review") nav(() => (mode = "review"), "back");
+          }}
         >
+          Review
+        </button>
         <button
           class="tab"
           class:on={mode === "cook"}
           aria-pressed={mode === "cook"}
-          onclick={() => (mode = "cook")}>Cook</button
+          onclick={() => {
+            if (mode !== "cook") nav(() => (mode = "cook"), "fwd");
+          }}
         >
+          Cook
+        </button>
       </div>
     </header>
 
@@ -447,17 +477,17 @@
               placeholder="e.g. the marinade belongs with the pork, not the paste"
             ></textarea>
             <div class="reanchor-actions">
-              <PillButton variant="accent" onclick={sendReanchor}
-                >Send</PillButton
-              >
-              <PillButton onclick={() => (reanchorOpen = false)}
-                >Cancel</PillButton
-              >
+              <PillButton variant="accent" onclick={sendReanchor}>
+                Send
+              </PillButton>
+              <PillButton onclick={() => (reanchorOpen = false)}>
+                Cancel
+              </PillButton>
             </div>
           {:else}
-            <button class="reanchor-open" onclick={() => (reanchorOpen = true)}
-              >Re-anchor differently…</button
-            >
+            <button class="reanchor-open" onclick={() => (reanchorOpen = true)}>
+              Re-anchor differently…
+            </button>
           {/if}
         </div>
       </div>
@@ -492,12 +522,10 @@
               <button
                 class="chip raw"
                 class:checked={prepChecked.has(`i${ii.toString()}`)}
+                aria-pressed={prepChecked.has(`i${ii.toString()}`)}
                 onclick={() => togglePrep(`i${ii.toString()}`)}
               >
-                {#if prepChecked.has(`i${ii.toString()}`)}<span
-                    class="tick"
-                    aria-hidden="true">✓</span
-                  >{/if}{ing.text}
+                {ing.text}
               </button>
             {/each}
           </div>
@@ -510,13 +538,13 @@
               <li>
                 <button
                   class="prep-row"
-                  class:done={prepChecked.has(`s${gi.toString()}`)}
+                  class:checked={prepChecked.has(`s${gi.toString()}`)}
                   aria-pressed={prepChecked.has(`s${gi.toString()}`)}
                   onclick={() => togglePrep(`s${gi.toString()}`)}
                 >
-                  <span class="box" aria-hidden="true"
-                    >{prepChecked.has(`s${gi.toString()}`) ? "☑" : "☐"}</span
-                  >
+                  <span class="box" aria-hidden="true">
+                    {prepChecked.has(`s${gi.toString()}`) ? "✓" : ""}
+                  </span>
                   <span class="prep-text">{step.text}</span>
                 </button>
               </li>
@@ -528,27 +556,47 @@
         <button class="cta" onclick={beginSteps}>Start cooking →</button>
       </footer>
     {:else if stepPos >= cookCount}
-      <!-- Done/log screen — the stepper's final screen, not a separate tab. -->
+      <!-- Done/log screen — the stepper's final screen, not a separate tab. The cook-complete
+           beat: a drawn green check (the "done/fresh" semantic, matching the grocery tick) and the
+           completion line, staged in. Every element's RESTING state is its final visible one,
+           so WidgetShell's global reduced-motion reset (and the local one in <style>) land on a
+           fully-formed screen — the reveal only ever enhances an already-drawn default. -->
       <div class="done">
         {#if logState === "logged"}
-          <div class="done-icon">✓</div>
-          <p class="done-title">Logged to your cooking history.</p>
-          <button class="link" onclick={() => (mode = "review")}
-            >Review the recipe again</button
+          <div class="medallion" aria-hidden="true">{@render doneCheck()}</div>
+          <p class="done-title rise" style:animation-delay="100ms">
+            Logged to your cooking history.
+          </p>
+          <button
+            class="link rise"
+            style:animation-delay="180ms"
+            onclick={() => nav(() => (mode = "review"), "back")}
           >
+            Review the recipe again
+          </button>
         {:else}
           {#if photoSrc}
-            <img class="hero" src={photoSrc} alt={data.name} />
+            <div class="hero-wrap">
+              <img class="hero" src={photoSrc} alt={data.name} />
+              <div class="stamp" aria-hidden="true">{@render doneCheck()}</div>
+            </div>
           {:else}
-            <div class="done-icon">🍽️</div>
+            <div class="medallion" aria-hidden="true">
+              {@render doneCheck()}
+            </div>
           {/if}
-          <p class="done-title">Nicely done — you made {data.name}.</p>
-          <div class="split">
+          <div class="done-copy rise" style:animation-delay="100ms">
+            <p class="done-title">Nicely done.</p>
+            <p class="done-sub">You made {data.name}.</p>
+          </div>
+          <div class="split rise" style:animation-delay="190ms">
             <button
               class="split-main"
               disabled={logState === "logging"}
-              onclick={logToday}>Log as today’s</button
+              onclick={logToday}
             >
+              Log as today’s
+            </button>
             <select
               class="split-select"
               bind:value={mealType}
@@ -559,12 +607,20 @@
               {/each}
             </select>
           </div>
-          <button class="link" onclick={logDifferentDay}
-            >Log a different day…</button
+          <button
+            class="link rise"
+            style:animation-delay="250ms"
+            onclick={logDifferentDay}
           >
-          <button class="link subtle" onclick={backToSteps}
-            >Back to steps</button
+            Log a different day…
+          </button>
+          <button
+            class="link subtle rise"
+            style:animation-delay="290ms"
+            onclick={backToSteps}
           >
+            Back to steps
+          </button>
         {/if}
       </div>
     {:else}
@@ -584,10 +640,17 @@
         <button
           class="navbtn"
           onclick={() =>
-            stepPos === 0 ? (cookPhase = "prep") : (stepPos -= 1)}
-          >{stepPos === 0 ? "← Prep" : "← Prev"}</button
+            nav(() => {
+              if (stepPos === 0) cookPhase = "prep";
+              else stepPos -= 1;
+            }, "back")}
         >
-        <button class="navbtn primary" onclick={() => (stepPos += 1)}>
+          {stepPos === 0 ? "← Prep" : "← Prev"}
+        </button>
+        <button
+          class="navbtn primary"
+          onclick={() => nav(() => (stepPos += 1), "fwd")}
+        >
           {stepPos === cookCount - 1 ? "Finish →" : "Next →"}
         </button>
       </footer>
@@ -598,20 +661,29 @@
 </WidgetShell>
 
 <!-- The cook-flow progress bar — `now` of `progressMax` slots (slot 1 is the prep screen,
-     slots 2..cookCount+1 the cook steps). Shared by the prep screen and the stepper. -->
+     slots 2..cookCount+1 the cook steps). Shared by the prep screen and the stepper. At the
+     terminal slot the fill has reached full: `.complete` fires a single glossy sheen sweep across
+     it, a one-shot state beat, not a looping shimmer.
+     Reduced motion drops the sweep entirely (the bar is simply full). -->
 {#snippet progressBar(now: number)}
   <div
     class="progress"
+    class:complete={now >= progressMax}
     role="progressbar"
     aria-valuenow={now}
     aria-valuemin={1}
     aria-valuemax={progressMax}
   >
-    <div
-      class="progress-fill"
-      style:width={`${((now / progressMax) * 100).toString()}%`}
-    ></div>
+    <div class="progress-fill" style:--p={Math.min(1, now / progressMax)}></div>
   </div>
+{/snippet}
+
+<!-- The completion check — the grocery tick's stroke-dashoffset draw at medallion scale, green
+     on the "done/fresh" semantic. Shared by the standalone medallion and the hero corner stamp. -->
+{#snippet doneCheck()}
+  <svg class="check-svg" viewBox="0 0 24 24" aria-hidden="true">
+    <path class="check-path" d="M5 12.5l4.2 4.2L19 6" />
+  </svg>
 {/snippet}
 
 {#snippet chipRow(step: Step, stepIdx: number, cookMode: boolean)}
@@ -632,12 +704,10 @@
           <button
             class="chip raw"
             class:checked={checked.has(key(stepIdx, ref))}
+            aria-pressed={checked.has(key(stepIdx, ref))}
             onclick={() => toggleChecked(stepIdx, ref)}
           >
-            {#if checked.has(key(stepIdx, ref))}<span
-                class="tick"
-                aria-hidden="true">✓</span
-              >{/if}{text}
+            {text}
           </button>
         {:else}
           <span class="chip raw" class:off={removed.has(key(stepIdx, ref))}>
@@ -645,8 +715,10 @@
             <button
               class="x"
               aria-label="Toggle this ingredient off"
-              onclick={() => toggleRemoved(stepIdx, ref)}>×</button
+              onclick={() => toggleRemoved(stepIdx, ref)}
             >
+              ×
+            </button>
           </span>
         {/if}
       {/each}
@@ -656,6 +728,7 @@
 
 <style>
   header {
+    view-transition-name: cook-header;
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
@@ -675,7 +748,7 @@
     flex: none;
     width: 42px;
     height: 42px;
-    border-radius: 9px;
+    border-radius: 10px;
     object-fit: cover;
     border: 1px solid color-mix(in oklch, var(--ink) 12%, transparent);
   }
@@ -706,7 +779,13 @@
       background 0.13s,
       color 0.13s;
   }
-  .tab:hover {
+  @media (hover: hover) {
+    .tab:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+  }
+  .tab:active {
     background: var(--hover);
     color: var(--ink);
   }
@@ -716,6 +795,7 @@
   }
 
   .scroll {
+    view-transition-name: cook-body;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -795,16 +875,17 @@
       opacity 0.13s,
       background 0.13s;
   }
-  button.chip.raw:hover {
+  @media (hover: hover) {
+    button.chip.raw:hover {
+      background: color-mix(in oklch, var(--accent) 18%, transparent);
+    }
+  }
+  button.chip.raw:active {
     background: color-mix(in oklch, var(--accent) 18%, transparent);
   }
   .chip.raw.checked {
     opacity: 0.5;
     text-decoration: line-through;
-  }
-  .chip .tick {
-    font-weight: 700;
-    text-decoration: none;
   }
   .chip.raw.off {
     opacity: 0.4;
@@ -817,7 +898,12 @@
     margin: 0;
     opacity: 0.65;
   }
-  .chip .x:hover {
+  @media (hover: hover) {
+    .chip .x:hover {
+      opacity: 1;
+    }
+  }
+  .chip .x:active {
     opacity: 1;
   }
   .chip.inter {
@@ -826,7 +912,12 @@
     border: 1px dashed color-mix(in oklch, var(--accent) 55%, transparent);
     transition: background 0.13s;
   }
-  .chip.inter:hover {
+  @media (hover: hover) {
+    .chip.inter:hover {
+      background: color-mix(in oklch, var(--accent) 10%, transparent);
+    }
+  }
+  .chip.inter:active {
     background: color-mix(in oklch, var(--accent) 10%, transparent);
   }
   .chip.inter .lead {
@@ -846,7 +937,12 @@
     text-decoration: underline;
     text-underline-offset: 2px;
   }
-  .reanchor-open:hover {
+  @media (hover: hover) {
+    .reanchor-open:hover {
+      color: var(--accent);
+    }
+  }
+  .reanchor-open:active {
     color: var(--accent);
   }
   .reanchor-box {
@@ -859,7 +955,7 @@
     color: var(--ink);
     background: var(--hover);
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 8px 10px;
   }
   .reanchor-actions {
@@ -870,6 +966,7 @@
 
   /* Bottom action bar (shared by review's CTA and cook's nav), pinned with safe-area pad. */
   .bar {
+    view-transition-name: cook-footer;
     flex: none;
     display: flex;
     gap: 10px;
@@ -888,11 +985,17 @@
     border-radius: 10px;
     transition: filter 0.13s;
   }
-  .cta:hover {
+  @media (hover: hover) {
+    .cta:hover {
+      filter: brightness(1.05);
+    }
+  }
+  .cta:active {
     filter: brightness(1.05);
   }
 
   .cook {
+    view-transition-name: cook-body;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -901,6 +1004,8 @@
     padding: 8px 18px 16px;
   }
   .progress {
+    view-transition-name: cook-progress;
+    position: relative;
     height: 4px;
     border-radius: 999px;
     background: var(--line);
@@ -909,9 +1014,48 @@
   }
   .progress-fill {
     height: 100%;
+    width: 100%;
     background: var(--accent);
-    border-radius: 999px;
-    transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+    /* Scale from the left instead of animating width (a layout property) so it composites on the
+       GPU. The `.progress` track's overflow:hidden + radius rounds the bar's outer ends; the fill's
+       leading edge is square mid-progress, since a radius on a scaled element would distort. Reduced-motion is
+       handled by WidgetShell's global transition-duration reset. */
+    transform-origin: left;
+    transform: scaleX(var(--p, 0));
+    transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  /* Terminal beat: one gloss sweep across the filled bar the moment it completes. It exists only
+     under `.complete` (full width == fill width, so no scaleX distortion to fight) and rests at
+     opacity 0, so with the global reduced-motion duration reset it never shows — the local
+     @media below drops it outright. `pointer-events:none` keeps it inert. */
+  .progress.complete::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(
+      100deg,
+      transparent 22%,
+      oklch(1 0 0 / 0.62) 50%,
+      transparent 78%
+    );
+    opacity: 0;
+    transform: translateX(-130%);
+    animation: sheen 0.62s cubic-bezier(0.2, 0.8, 0.2, 1) 0.12s both;
+    pointer-events: none;
+  }
+  @keyframes sheen {
+    0% {
+      opacity: 0;
+      transform: translateX(-130%);
+    }
+    36% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+      transform: translateX(130%);
+    }
   }
   .kn {
     margin: 12px 0 0;
@@ -987,23 +1131,49 @@
     color: var(--ink);
     transition: opacity 0.13s;
   }
+  /* A fixed-size checkbox, not a glyph swap: ☐/☑ have different metrics and jump on tick.
+     Empty bordered square that fills green (the done/fresh semantic) with a centered tick
+     when checked; only colours transition, so the reduced-motion reset covers it. */
   .prep-row .box {
     flex: none;
-    font-size: 15px;
-    line-height: 1.4;
-    color: var(--accent);
+    box-sizing: border-box;
+    width: 18px;
+    height: 18px;
+    margin-top: 1px;
+    display: grid;
+    place-items: center;
+    border: 1.5px solid color-mix(in oklch, var(--accent) 45%, transparent);
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--success-ink);
+    transition:
+      background 0.15s,
+      border-color 0.15s;
+  }
+  .prep-row.checked .box {
+    background: var(--success);
+    border-color: var(--success);
   }
   .prep-row .prep-text {
     font-size: 14px;
     line-height: 1.45;
   }
-  .prep-row.done {
+  /* `checked`, not `done`: the generic `.done` here is the cook-complete SCREEN container
+     (flex-column, centered), and a `.prep-row.done` would inherit that centering when ticked. */
+  .prep-row.checked {
     opacity: 0.5;
   }
-  .prep-row.done .prep-text {
+  .prep-row.checked .prep-text {
     text-decoration: line-through;
   }
-  .prep-row:hover {
+  @media (hover: hover) {
+    .prep-row:hover {
+      color: var(--accent);
+    }
+  }
+  .prep-row:active {
     color: var(--accent);
   }
 
@@ -1022,7 +1192,12 @@
   /* Scope the subtle hover to the non-primary (Prev) button — on the filled primary it
      would swap the accent fill for --hover while keeping dark --accent-ink text
      (unreadable dark-on-dark). The primary brightens its own fill instead. */
-  .nav .navbtn:not(.primary):hover:not(:disabled) {
+  @media (hover: hover) {
+    .nav .navbtn:not(.primary):hover:not(:disabled) {
+      background: var(--hover);
+    }
+  }
+  .nav .navbtn:not(.primary):active:not(:disabled) {
     background: var(--hover);
   }
   .nav .navbtn:disabled {
@@ -1034,36 +1209,143 @@
     background: var(--accent);
     color: var(--accent-ink);
   }
-  .nav .navbtn.primary:hover:not(:disabled) {
+  @media (hover: hover) {
+    .nav .navbtn.primary:hover:not(:disabled) {
+      filter: brightness(1.06);
+    }
+  }
+  .nav .navbtn.primary:active:not(:disabled) {
     filter: brightness(1.06);
   }
 
   .done {
+    view-transition-name: cook-body;
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     text-align: center;
-    gap: 12px;
+    gap: 14px;
     padding: 32px 24px calc(32px + env(safe-area-inset-bottom));
   }
-  .done-icon {
-    font-size: 34px;
+  /* Completion medallion (no cover photo) — the solid-green disc + white check of the grocery
+     tick, at reward scale. Pops in; its check draws. */
+  .medallion {
+    display: grid;
+    place-items: center;
+    width: 52px;
+    height: 52px;
+    border-radius: 999px;
+    background: var(--success);
+    animation: popIn 0.38s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  .medallion .check-svg {
+    width: 30px;
+    height: 30px;
+  }
+  /* Cover-photo path: the same check, stamped on the plated dish as a "done" seal. */
+  .hero-wrap {
+    position: relative;
+    display: inline-flex;
+    animation: popIn 0.38s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  .stamp {
+    position: absolute;
+    right: -8px;
+    bottom: -8px;
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    background: var(--success);
+    border: 2.5px solid var(--bg);
+    box-shadow: 0 4px 12px -5px oklch(0 0 0 / 0.4);
+  }
+  .stamp .check-svg {
+    width: 18px;
+    height: 18px;
+  }
+  .check-svg {
+    display: block;
+    overflow: visible;
+  }
+  .check-path {
+    fill: none;
+    stroke: var(--success-ink);
+    stroke-width: 2.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* Resting state = drawn (offset 0); the keyframe draws it FROM 24. So a headless render or the
+       reduced-motion reset lands on a finished check, never a blank disc. */
+    stroke-dasharray: 24;
+    stroke-dashoffset: 0;
+    animation: drawCheck 0.34s cubic-bezier(0.2, 0.8, 0.2, 1) 0.13s both;
   }
   .hero {
     width: 100%;
     max-width: 260px;
     max-height: 190px;
     object-fit: cover;
-    border-radius: 16px;
+    border-radius: 14px;
     border: 1px solid color-mix(in oklch, var(--ink) 12%, transparent);
+  }
+  .done-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
   }
   .done-title {
     margin: 0;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: 16px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--ink);
     max-width: 30ch;
+  }
+  .done-sub {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--muted);
+    max-width: 32ch;
+  }
+  /* Staged arrival — each beat rises into its already-visible resting state. */
+  .rise {
+    animation: riseIn 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  @keyframes popIn {
+    0% {
+      opacity: 0;
+      transform: scale(0.72);
+    }
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+  @keyframes drawCheck {
+    from {
+      stroke-dashoffset: 24;
+    }
+  }
+  @keyframes riseIn {
+    from {
+      opacity: 0;
+      transform: translateY(7px);
+    }
+  }
+  /* Reduced motion: kill the entrance/sheen animations outright (not just their duration), so the
+     staggered animation-delays can't hold a hidden `backwards`-fill frame — every element sits at
+     its visible resting state at once. Complements WidgetShell's global duration reset. */
+  @media (prefers-reduced-motion: reduce) {
+    .medallion,
+    .hero-wrap,
+    .check-path,
+    .rise,
+    .progress.complete::after {
+      animation: none !important;
+    }
   }
 
   /* Split log button: one action ("Log as today’s") joined to a native meal-type select.
@@ -1084,7 +1366,12 @@
     padding: 10px 14px;
     transition: filter 0.13s;
   }
-  .split-main:hover:not(:disabled) {
+  @media (hover: hover) {
+    .split-main:hover:not(:disabled) {
+      filter: brightness(1.05);
+    }
+  }
+  .split-main:active:not(:disabled) {
     filter: brightness(1.05);
   }
   .split-main:disabled {
@@ -1116,10 +1403,81 @@
   .link.subtle {
     color: var(--muted);
   }
-  .link:hover {
+  @media (hover: hover) {
+    .link:hover {
+      filter: brightness(1.08);
+    }
+  }
+  .link:active {
     filter: brightness(1.08);
   }
   .link:focus-visible {
     border-radius: 6px;
+  }
+
+  /* ── View Transitions: iOS-style page push ─────────────────────────────────────────────
+     The cook flow PUSHES between screens (nav() wraps every screen change; it never starts a
+     transition under reduced motion or without the API, so the fallback IS the instant swap).
+     The header and progress bar hold their place (their own view-transition-names); the body and
+     its action footer slide the FULL width in lockstep — no cross-fade — direction set by
+     `data-cook-vt` on the root. `::view-transition-*` are document-level pseudos, so `:global`. */
+  :global(::view-transition-group(cook-body)),
+  :global(::view-transition-group(cook-header)),
+  :global(::view-transition-group(cook-footer)),
+  :global(::view-transition-group(cook-progress)) {
+    animation-duration: 0.34s;
+    animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  /* Everything visible is a named group; keep the empty root from cross-fading the backdrop. */
+  :global(::view-transition-old(root)),
+  :global(::view-transition-new(root)) {
+    animation: none;
+  }
+  /* Body + footer travel as one rigid unit: old and new share one easing so the seam stays tight,
+     and the move is pure translate (no opacity) — the outgoing screen slides fully off, the
+     incoming slides fully in, clipped to each group's box (the screen edges). */
+  :global(html[data-cook-vt="fwd"]::view-transition-old(cook-body)),
+  :global(html[data-cook-vt="fwd"]::view-transition-old(cook-footer)) {
+    animation: cook-push-out-left 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  :global(html[data-cook-vt="fwd"]::view-transition-new(cook-body)),
+  :global(html[data-cook-vt="fwd"]::view-transition-new(cook-footer)) {
+    animation: cook-push-in-right 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  :global(html[data-cook-vt="back"]::view-transition-old(cook-body)),
+  :global(html[data-cook-vt="back"]::view-transition-old(cook-footer)) {
+    animation: cook-push-out-right 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  :global(html[data-cook-vt="back"]::view-transition-new(cook-body)),
+  :global(html[data-cook-vt="back"]::view-transition-new(cook-footer)) {
+    animation: cook-push-in-left 0.34s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  @keyframes cook-push-in-right {
+    from {
+      transform: translateX(100%);
+    }
+  }
+  @keyframes cook-push-out-left {
+    to {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes cook-push-in-left {
+    from {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes cook-push-out-right {
+    to {
+      transform: translateX(100%);
+    }
+  }
+  /* Belt-and-suspenders: even if a transition ever starts under reduced motion, don't animate. */
+  @media (prefers-reduced-motion: reduce) {
+    :global(::view-transition-group(*)),
+    :global(::view-transition-old(*)),
+    :global(::view-transition-new(*)) {
+      animation: none !important;
+    }
   }
 </style>

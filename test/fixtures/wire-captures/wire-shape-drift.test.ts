@@ -73,8 +73,8 @@ function wireKeys(entry: { requestBody: unknown; responseBody: unknown }, source
   return [...keySet].sort();
 }
 
-function schemaInputKeys(schema: { innerType: () => { shape: Record<string, unknown> } }): string[] {
-  return Object.keys(schema.innerType().shape).sort();
+function schemaInputKeys(schema: { in: { shape: Record<string, unknown> } }): string[] {
+  return Object.keys(schema.in.shape).sort();
 }
 
 async function capturePostBody(
@@ -195,7 +195,7 @@ describe("wire-shape drift detection", () => {
   });
 
   describe("PaprikaClient POST serialization vs wire captures", () => {
-    const server = useMswServer([], { onUnhandledRequest: "bypass" });
+    const server = useMswServer([], { onUnhandledFrame: "bypass" });
 
     it("saveRecipe sends exact wire POST keys including deleted (#125)", async () => {
       const wirePostKeys = wireKeys(writeFixture("create recipe ([mcp-cap] Test Recipe)"), "request");

@@ -1,15 +1,15 @@
 # Configuration
 
-mcp-paprika resolves each setting from the first place it's defined, in priority
-order:
+mcp-paprika resolves each setting from the first of these that defines it:
 
-1. **Environment variables** (highest priority)
-2. **`.env` file** in the config directory
-3. **`config.json`** in the config directory
-4. **Schema defaults** (the fallback when nothing above sets a value)
+1. **The process environment** (highest priority)
+2. **A `.env` file** in the config directory (see [`.env` file](#env-file))
+3. **The built-in default**
 
-Environment variables always win. If you set `PAPRIKA_EMAIL` as an env var and also
-list it in `config.json`, the env var is used.
+Releases before 2.0 also read a `config.json` from the config directory. That file is
+no longer read: if it exists, the server stops at boot and names the file, so a stale
+setting can't be silently ignored. Move each setting to its environment variable
+(listed below) in `.env`, then delete `config.json`.
 
 The HTTP transport and its OAuth layer have their own config references:
 [http-transport.md](http-transport.md) for binding, host/origin allowlists, and
@@ -21,72 +21,86 @@ common to both transports.
 
 ### Core
 
-| Variable                          | Config path                   | Required | Default   | Description                                                           |
-| --------------------------------- | ----------------------------- | -------- | --------- | --------------------------------------------------------------------- |
-| `PAPRIKA_EMAIL`                   | `paprika.email`               | Yes      | —         | Paprika account email                                                 |
-| `PAPRIKA_PASSWORD`                | `paprika.password`            | Yes      | —         | Paprika account password                                              |
-| `PAPRIKA_SYNC_INTERVAL`           | `sync.interval`               | No       | `"15m"`   | Background sync polling interval                                      |
-| `PAPRIKA_SYNC_ENABLED`            | `sync.enabled`                | No       | `true`    | Enable background sync                                                |
-| `PAPRIKA_SYNC_PENDING_WRITE_TTL`  | `sync.pendingWriteTtl`        | No       | `"60s"`   | How long a local write is shielded from sync reconciliation           |
-| `PAPRIKA_SYNC_RECIPE_CONCURRENCY` | `sync.recipeFetchConcurrency` | No       | `5`       | Concurrent recipe fetches during sync (see note below)                |
-| `MCP_TRANSPORT`                   | `transport`                   | No       | `"stdio"` | Transport mode: `"stdio"` (CLI clients) or `"http"` (Streamable HTTP) |
+| Variable                          | Required | Default   | Description                                                           |
+| --------------------------------- | -------- | --------- | --------------------------------------------------------------------- |
+| `PAPRIKA_EMAIL`                   | Yes      | —         | Paprika account email                                                 |
+| `PAPRIKA_PASSWORD`                | Yes      | —         | Paprika account password                                              |
+| `PAPRIKA_SYNC_INTERVAL`           | No       | `"15m"`   | Background sync polling interval                                      |
+| `PAPRIKA_SYNC_ENABLED`            | No       | `true`    | Enable background sync                                                |
+| `PAPRIKA_SYNC_PENDING_WRITE_TTL`  | No       | `"60s"`   | How long a local write is shielded from sync reconciliation           |
+| `PAPRIKA_SYNC_RECIPE_CONCURRENCY` | No       | `5`       | Concurrent recipe fetches during sync (see note below)                |
+| `PAPRIKA_PHOTO_FILE_ROOTS`        | No       | —         | stdio only: directories `upload_recipe_photo` may read files from     |
+| `MCP_TRANSPORT`                   | No       | `"stdio"` | Transport mode: `"stdio"` (CLI clients) or `"http"` (Streamable HTTP) |
 
 When `MCP_TRANSPORT=http`, see [http-transport.md](http-transport.md) and
 [oauth-configuration.md](oauth-configuration.md) for the `MCP_HTTP_*`, `MCP_OIDC_*`,
 `MCP_ALLOWED_*`, and `MCP_OAUTH_*` variables.
 
+### Demand-driven sync
+
+Set `PAPRIKA_SYNC_MODE=lazy` to defer authentication and cloud sync until an actual tool call. The default `eager` retains startup and background sync. In lazy mode `PAPRIKA_SYNC_INTERVAL` is the maximum age of the last completely successful sync (default `15m`, minimum `1s`); no idle timer runs. Connection, initialization, catalog discovery and resource reads do not start a bulk sync. Resource reads use the shared disk snapshot; an individual photo read may still fetch its image from Paprika.
+
+All processes sharing a cache directory must use lazy mode and the same account. Do not run eager or older clients against that directory concurrently. A local-filesystem lease serializes cache hydration and complete tool operations, including writes. A waiting tool rechecks freshness after acquiring the lease and reloads all stores and recipe hash indexes before use. Lock acquisition gives up after about 25 seconds; abandoned locks are recoverable after two minutes. Keep the cache on a local filesystem, not a distributed store.
+
+A sync is fresh only after every reconcile and the durable flush succeed. Failed/partial syncs return an explicit tool error and do not become empty meal plans; subsequent attempts back off for 30 seconds. A local write postpones cloud reconciliation for `PAPRIKA_SYNC_PENDING_WRITE_TTL` (default `60s`) across processes, without pretending a successful cloud sync occurred. An interrupted or error-returning write requires reconciliation after that window. Read-only tools can use the last good snapshot during the propagation window after a completed write.
+
+`PAPRIKA_REQUEST_TIMEOUT` bounds each cloud request attempt, including login (default `20s`, minimum `1s`). Existing retries still apply, so an entire tool call can take longer. This does not enlarge a scheduler's independent execution budget: short-budget triggers should not depend on a potentially cold/stale cloud read.
+
+Lazy mode currently requires `EMBEDDING_MODEL` to be unset: cross-process coordination of the optional derived semantic-search index is not implemented. Ordinary recipe search and all other tools remain available. The configuration validator rejects this unsupported combination rather than silently serving a stale vector index.
+
+The private `.lazy-sync-state` file under the cache root stores successful-sync/attempt timestamps, a write-propagation checkpoint and an account digest, never credentials or recipe contents. Do not edit it during live operations. A missing marker causes a fresh sync on first use; a malformed marker fails closed and needs operator inspection.
+
 ### Logging
 
-| Variable               | Config path           | Required | Default  | Description                                                                      |
-| ---------------------- | --------------------- | -------- | -------- | -------------------------------------------------------------------------------- |
-| `MCP_LOG_LEVEL`        | `logging.level`       | No       | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`                    |
-| `MCP_LOG_NOTIFY_LEVEL` | `logging.notifyLevel` | No       | `"warn"` | Minimum level forwarded to connected MCP clients                                 |
-| `MCP_LOG_PRETTY`       | `logging.pretty`      | No       | `"auto"` | Pretty-print: `true`, `false`, or `"auto"` (pretty for stdio TTY, JSON for HTTP) |
-| `MCP_LOG_FILE`         | `logging.file`        | No       | —        | Override default log file path (stdio non-TTY only)                              |
+| Variable               | Required | Default  | Description                                                                      |
+| ---------------------- | -------- | -------- | -------------------------------------------------------------------------------- |
+| `MCP_LOG_LEVEL`        | No       | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`                    |
+| `MCP_LOG_NOTIFY_LEVEL` | No       | `"warn"` | Minimum level forwarded to connected MCP clients                                 |
+| `MCP_LOG_PRETTY`       | No       | `"auto"` | Pretty-print: `true`, `false`, or `"auto"` (pretty for stdio TTY, JSON for HTTP) |
+| `MCP_LOG_FILE`         | No       | —        | Override default log file path (stdio non-TTY only)                              |
 
-### Semantic search (optional)
+### AI features (optional)
 
-| Variable          | Config path                   | Required | Default | Description                 |
-| ----------------- | ----------------------------- | -------- | ------- | --------------------------- |
-| `OPENAI_API_KEY`  | `features.embeddings.apiKey`  | No       | —       | Embedding provider API key  |
-| `OPENAI_BASE_URL` | `features.embeddings.baseUrl` | No       | —       | Embedding provider base URL |
-| `EMBEDDING_MODEL` | `features.embeddings.model`   | No       | —       | Embedding model identifier  |
+Semantic search (`discover_recipes`) and recipe photo generation (`generate_recipe_photo`)
+share one set of OpenAI-compatible credentials.
 
-Set all three together to enable semantic search. If any are missing, the
-`discover_recipes` tool isn't registered and the server logs
-`Semantic search: disabled` on startup. [embedding-providers.md](embedding-providers.md)
-covers provider choices (Ollama, OpenAI, OpenRouter) with worked examples.
+| Variable            | Required | Default                        | Description                                                 |
+| ------------------- | -------- | ------------------------------ | ----------------------------------------------------------- |
+| `OPENAI_API_KEY`    | No       | —                              | API key for every AI feature                                |
+| `OPENAI_BASE_URL`   | No       | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL, up to `/v1`                     |
+| `EMBEDDING_MODEL`   | No       | —                              | Embedding model; setting it turns on semantic search        |
+| `IMAGE_GEN_ENABLED` | No       | `true`                         | Set `false` to keep photo generation off while a key is set |
 
-### Recipe photo generation (optional)
+- **Semantic search** turns on when `OPENAI_API_KEY` and `EMBEDDING_MODEL` are both set.
+  Without them, `discover_recipes` answers that semantic search isn't configured, and
+  the server logs `semantic search disabled` on startup. [embedding-providers.md](embedding-providers.md)
+  covers provider choices (Ollama, OpenAI, OpenRouter) with worked examples.
+- **Photo generation** turns on when `OPENAI_API_KEY` is set and `OPENAI_BASE_URL` is
+  OpenRouter (the default); it only works with OpenRouter's image models. It bills per
+  image, so set `IMAGE_GEN_ENABLED=false` if you want the key for search only. When it's
+  off, `generate_recipe_photo` answers that it isn't configured. The image models are
+  served through OpenRouter's chat-completions API, and the **model is chosen per
+  `generate_recipe_photo` call**, not in config.
 
-| Variable                           | Config path                              | Required | Default                        | Description                                                   |
-| ---------------------------------- | ---------------------------------------- | -------- | ------------------------------ | ------------------------------------------------------------- |
-| `IMAGE_GEN_API_KEY`                | `features.imageGen.apiKey`               | No       | —                              | OpenRouter API key dedicated to image generation              |
-| `IMAGE_GEN_BASE_URL`               | `features.imageGen.baseUrl`              | No       | `https://openrouter.ai/api/v1` | OpenRouter base URL (only used with a dedicated key)          |
-| `IMAGE_GEN_REUSE_EMBEDDINGS_CREDS` | `features.imageGen.reuseEmbeddingsCreds` | No       | `false`                        | Reuse the embedding (`OPENAI_*`) credentials instead of a key |
+Setting `EMBEDDING_MODEL` or `OPENAI_BASE_URL` without `OPENAI_API_KEY` is a
+configuration error. Releases before 2.0 used `IMAGE_GEN_API_KEY`, `IMAGE_GEN_BASE_URL`,
+and `IMAGE_GEN_REUSE_EMBEDDINGS_CREDS` for photo generation; the server now stops at boot
+if any of them is set, with what to use instead.
 
-Image generation powers the `generate_recipe_photo` tool (OpenRouter chat-completions image
-models). Enable it **one** of two ways:
+### Duration format
 
-- Set `IMAGE_GEN_API_KEY` (and optionally `IMAGE_GEN_BASE_URL`) for a **dedicated**
-  key, which gives you an isolated OpenRouter billing line for photo generation; or
-- Set `IMAGE_GEN_REUSE_EMBEDDINGS_CREDS=true` to **reuse** your embedding provider's
-  credentials (valid only when `features.embeddings` is configured and points at
-  OpenRouter).
+`PAPRIKA_SYNC_INTERVAL`, `PAPRIKA_SYNC_PENDING_WRITE_TTL`, and `MCP_HTTP_SHUTDOWN_DRAIN`
+take a duration in Go's format: one or more number-and-unit pairs, with no spaces.
 
-Setting both, or setting neither while the block exists, is a configuration error. The
-**model is chosen per `generate_recipe_photo` call**, not in config. If image generation isn't
-enabled, `generate_recipe_photo` isn't registered.
+- Units: `ns`, `us` (or `µs`/`μs`), `ms`, `s`, `m`, and `h`. There's no day unit, as in Go; write `168h` for a week
+- Examples: `15m`, `1h30m`, `500ms`, `1.5h`, `.5h`, `168h`
+- `0` means zero (off, for the pending-write TTL and the shutdown drain)
+- At most `596h`, because Node's timers can't wait longer
+- The sync interval must be at least `1s`
 
-### Sync interval format
-
-`PAPRIKA_SYNC_INTERVAL` and `PAPRIKA_SYNC_PENDING_WRITE_TTL` accept human-readable
-durations:
-
-- `"15m"`, `"30 minutes"`, `"1 hour"`
-- `"1h30m"`, `"1 hr 30 min"`
-- ISO 8601: `"PT15M"`
-- Bare numbers are treated as milliseconds: `900000`
+Any other bare number (`900`, `900000`) is rejected at boot, because it doesn't say
+whether it means seconds, minutes, or milliseconds. So are ISO 8601 (`PT15M`) and
+phrases like `15 minutes`.
 
 ### Sync enabled format
 
@@ -103,11 +117,29 @@ tradeoff**: high concurrency against a single origin makes rate-limiting (HTTP 4
 circuit-breaker trips more likely. Values above `20` are allowed but log a startup
 warning. The retry and circuit-breaker stack still protects you; tune conservatively.
 
+If Paprika rate-limits a cold start partway through, the recipes that arrived are kept,
+and sync retries the rest after a short delay rather than waiting `PAPRIKA_SYNC_INTERVAL`.
+
+### Photo uploads from local files
+
+`upload_recipe_photo` can read an image straight from disk with `source: { path }`, for
+stdio deployments where the server shares a filesystem with the agent (for example, a
+sandboxed agent container that receives chat attachments). It is off unless
+`PAPRIKA_PHOTO_FILE_ROOTS` lists the allowed directories, comma-separated like the other
+list settings. The file's real path, after symlinks, must sit under one of them, and the
+10 MB image cap applies. The setting is stdio-only: with `MCP_TRANSPORT=http` the server
+refuses to start, because a remote caller must never be able to read the server's disk.
+
 ## Logging
 
 The server uses structured [pino](https://getpino.io/) logging. In stdio mode, logs go
 to stderr (TTY) or a file (non-TTY) to keep stdout clean for the MCP wire format. In
 HTTP mode, logs go to stdout as raw JSON.
+
+Every JSON record carries `level` as a lowercase name (`info`, `warn`, ...),
+`service: "mcp-paprika"`, and the `component` that logged it. Records logged inside a
+span also carry `trace_id` and `span_id`. The HTTP access-log record (`http request`)
+carries `http_method`, `path`, `http_status`, and `duration_ms`.
 
 `MCP_LOG_PRETTY=auto` (the default) uses pino-pretty for all stdio output, both TTY (to
 stderr) and non-TTY (to the log file). HTTP transport always emits raw JSON to stdout
@@ -122,77 +154,27 @@ MCP clients as logging messages.
 Traces and metrics are **off by default** and activate when `OTEL_EXPORTER_OTLP_ENDPOINT`
 (or a signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `…_METRICS_ENDPOINT`) is
 set. Configuration uses the [standard OTel environment variables](https://opentelemetry.io/docs/languages/sdk-configuration/)
-read by the SDK itself — nothing telemetry-related lives in `config.json` or the
-`MCP_*` namespace. These variables may sit in the same `.env` file as the rest of the
+read by the SDK itself — nothing telemetry-related lives in the `MCP_*` or
+`PAPRIKA_*` namespaces. These variables may sit in the same `.env` file as the rest of the
 configuration. `OTEL_LOG_LEVEL` diagnostics go to stderr (never stdout — the stdio MCP
 wire). The full operator guide, including a local Grafana/collector stand-up, is
 [docs/telemetry.md](telemetry.md).
 
-## Config file
-
-Place a `config.json` in the config directory. All fields are optional, and you can mix
-config file and env vars.
-
-```json
-{
-  "paprika": {
-    "email": "you@example.com",
-    "password": "your-password"
-  },
-  "sync": {
-    "enabled": true,
-    "interval": "15m"
-  },
-  "transport": "http",
-  "http": {
-    "port": 3000,
-    "host": "0.0.0.0"
-  },
-  "oauth": {
-    "publicUrl": "https://mcp.example.com",
-    "preset": "google",
-    "clientId": "...",
-    "clientSecret": "...",
-    "allowlist": {
-      "emails": ["you@example.com"]
-    }
-  },
-  "logging": {
-    "level": "info",
-    "notifyLevel": "warn"
-  },
-  "features": {
-    "embeddings": {
-      "apiKey": "sk-...",
-      "baseUrl": "http://localhost:11434/v1",
-      "model": "nomic-embed-text"
-    },
-    "imageGen": {
-      "apiKey": "sk-or-..."
-    }
-  }
-}
-```
-
 ## `.env` file
 
-You can also place a `.env` file in the config directory. A stdio (local CLI) setup:
+Place a `.env` file in the config directory (see [Config directory location](#config-directory-location)) to keep settings out of your shell or your MCP client's config. One `NAME=value` per line. A stdio (local CLI) setup:
 
 ```bash
 PAPRIKA_EMAIL=you@example.com
 PAPRIKA_PASSWORD=your-password
 PAPRIKA_SYNC_INTERVAL=15m
 
-# Optional: enable semantic search
-OPENAI_BASE_URL=http://localhost:11434/v1
-OPENAI_API_KEY=ollama
-EMBEDDING_MODEL=nomic-embed-text
-
-# Optional: enable AI recipe-photo generation (generate_recipe_photo).
-# Either a dedicated OpenRouter key:
-IMAGE_GEN_API_KEY=sk-or-...
-# ...or reuse the embedding creds above (when they point at OpenRouter):
-# IMAGE_GEN_REUSE_EMBEDDINGS_CREDS=true
+# Optional: AI features, sharing one OpenRouter key
+OPENAI_API_KEY=sk-or-...
+# Semantic search (discover_recipes):
+EMBEDDING_MODEL=openai/text-embedding-3-small
+# Photo generation (generate_recipe_photo) is on whenever the key is set:
+# IMAGE_GEN_ENABLED=false
 ```
 
 The same variables work for HTTP; [quick-start-http.md](quick-start-http.md) shows the

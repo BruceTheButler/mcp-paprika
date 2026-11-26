@@ -9,7 +9,7 @@ import type { Recipe } from "../types.js";
 import { defineTool } from "../../../kernel/tool.js";
 import { errorResult, structuredResult } from "../../../shared/tools.js";
 import { parseDuration } from "../../../utils/duration.js";
-import { recipeToRow, searchRecipesOutputSchema } from "../recipe-markdown.js";
+import { recipeToRow, searchRecipesOutputSchema } from "../recipe-helpers.js";
 import { recipeColdStartGuard } from "./guards.js";
 
 export const searchRecipesInputSchema = z
@@ -32,11 +32,8 @@ export const searchRecipesInputSchema = z
       .default(20)
       .describe("Maximum number of results to return (default: 20, max: 50)"),
   })
-  // Plain `.strict()` — NOT `.superRefine`/`.refine`. A refined schema is a
-  // ZodEffects, which the MCP SDK serializes to an EMPTY published inputSchema
-  // (it reads `.shape`, which only a plain object has), so the model would see
-  // search_recipes as taking no arguments. The "at least one criterion" rule is
-  // therefore enforced at runtime in the handler, not on the schema.
+  // The "at least one criterion" rule is enforced at runtime in the handler,
+  // not on the schema, so the rejection carries the handler's remediation hint.
   .strict();
 
 /**
@@ -101,14 +98,14 @@ export const searchRecipesTool = defineTool(
             ? { source: "search" as const, query: args.query! }
             : { source: "search" as const };
 
-          // Build candidate set from the search/getAll path.
+          // Build candidate set from the search/getActive path.
           let queryResults: Array<{ recipe: Recipe; score?: number }>;
           if (hasQuery) {
             // search() returns scored results, no limit yet — we limit after intersection.
             queryResults = ctx.state.recipe.store.search(args.query!, {});
           } else {
             // No free-text query: start from all recipes (scored undefined).
-            queryResults = ctx.state.recipe.store.getAll().map((recipe) => ({ recipe }));
+            queryResults = ctx.state.recipe.store.getActive().map((recipe) => ({ recipe }));
           }
 
           // Intersect with ingredient filter.

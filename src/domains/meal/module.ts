@@ -7,7 +7,7 @@ import type { MealApi, MealCreateError } from "./api.js";
 import type { Meal } from "./types.js";
 
 import { DiskCache as DiskCacheImpl } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -38,8 +38,7 @@ export interface MealState {
 
 /**
  * Meal's write chokepoints (`ctx.writes`), invoked by its own plan / update /
- * delete / reschedule / log-cooked tools. No `resourceListChanged()` — meals have
- * no MCP resource surface.
+ * delete / reschedule / log-cooked tools.
  */
 export interface MealWrites {
   /** Persist a saved meal locally (upsert or soft-delete), then nudge cloud sync. */
@@ -74,8 +73,7 @@ register(
       // write the meal-planner coordinator consumes via `ctx.deps.meal`.
       //
       // The commit protocol (mark-first → cache → flush → clear-on-failure → store
-      // → notify) lives in src/entity/commit.ts; these bind meal's slice. No
-      // resourceListChanged() — meals have no resource surface.
+      // → notify) lives in src/entity/commit.ts; these bind meal's slice.
       const mealFx = { finish: () => notifySyncBestEffort(client, infra.log) };
       const commitMeal: MealWrites["commitMeal"] = (saved) => commitEntities(state, [deletedFlagOp(saved)], mealFx);
       const commitMealsBatch: MealWrites["commitMealsBatch"] = (items) =>
@@ -129,6 +127,7 @@ register(
           readMealPlanTool,
         ],
         syncs: [mealSync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),

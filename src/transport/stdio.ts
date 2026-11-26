@@ -8,10 +8,11 @@ import { buildKernel } from "../kernel/registry.js";
 import { buildBrandedServer, buildInfraBase } from "../server/build.js";
 import { createIndexEvents } from "../server/index-events.js";
 import { createServerRef, singleServerNotifier } from "../server/notifier.js";
-import { notifyFromResults, runSyncLoop } from "../server/sync-loop.js";
+import { runSyncLoop } from "../server/sync-loop.js";
 import { shutdownTelemetry } from "../telemetry/bootstrap.js";
 import { clientAttrs, clientFingerprint, recordClientConnection } from "../telemetry/client-fingerprint.js";
 import { ATTR_MCP_PAPRIKA_TRANSPORT, mcpServerSessionDuration } from "../telemetry/instruments.js";
+import { recordMcpOperations } from "../telemetry/mcp-operations.js";
 import { startTimer } from "../telemetry/scope.js";
 // Side-effect: every domain/feature module self-registers on import, so the kernel's
 // `registeredModules()` is populated before `buildKernel` reads it.
@@ -70,14 +71,14 @@ export async function startStdio(config: PaprikaConfig): Promise<TransportHandle
   const tlog = log.child({ component: "transport-stdio" });
 
   // The interval loop runs its first cycle immediately (then waits), so — combined
-  // with buildKernel's initial cycle — startup syncs twice. notifyFromResults turns
-  // each cycle's returned results into resourceListChanged notifications, filtered to
-  // the change types with a resource surface.
-  const loop = config.sync.enabled
-    ? runSyncLoop(async () => {
-        notifyFromResults(await kernel.syncOnce(), notifier);
-      }, config.sync.interval)
-    : null;
+  // with buildKernel's initial cycle — startup syncs twice. The cycle keeps the local
+  // cache warm; its results are discarded (no resource-list notification to fan out).
+  const loop =
+    config.sync.enabled && config.sync.mode !== "lazy"
+      ? runSyncLoop(async () => {
+          return (await kernel.syncOnce()).outcome;
+        }, config.sync.interval)
+      : null;
   if (loop !== null) {
     tlog.info({ intervalMs: config.sync.interval }, "sync engine started");
   } else {
@@ -120,6 +121,7 @@ export async function startStdio(config: PaprikaConfig): Promise<TransportHandle
     }
     deliver?.(message);
   };
+  recordMcpOperations(transport);
   tlog.info("server ready");
 
   // The single end-of-session point, latched: the stdin-EOF handler below and

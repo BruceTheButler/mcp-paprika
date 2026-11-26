@@ -25,3 +25,16 @@ export function hydrateStore<T>(
     if (all.length > 0) store.load(all);
   });
 }
+
+/** Replace a query store from the latest shared snapshot, including a valid empty snapshot.
+ * Only call under the shared operation lock: refresh discards uncommitted failed-operation buffers.
+ */
+export function reloadStore<T>(
+  cache: { refresh(): ResultAsync<void, CacheError>; getAll(): ResultAsync<Array<T>, CacheError> },
+  store: { load(items: ReadonlyArray<T>): void },
+): ResultAsync<void, CacheError> {
+  return cache
+    .refresh()
+    .andThen(() => cache.getAll())
+    .map((all) => store.load(all));
+}

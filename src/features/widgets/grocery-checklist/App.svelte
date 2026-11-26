@@ -3,6 +3,7 @@
 
   import { onMount } from "svelte";
   import { flip } from "svelte/animate";
+  import { fade } from "svelte/transition";
 
   import BrandMark from "../shared/BrandMark.svelte";
   import GroupedList from "../shared/GroupedList.svelte";
@@ -25,6 +26,7 @@
     GroceryItemRow,
     GroceryListReadStructured,
   } from "../shared/server-types.js";
+  import { createSwipeAction } from "../shared/swipe-action.js";
 
   // A checklist row: the server's structured grocery item (B1 — a rename of its fields breaks this
   // widget at compile time) plus transient per-row UI flags.
@@ -47,24 +49,64 @@
   let errorMsg = $state<string | null>(null);
   let confirmingClear = $state(false);
   let confirmingMove = $state(false);
+  // True only right after confirmClear() empties the list — distinguishes the "you just finished
+  // shopping" empty state from the plain "never added anything" one. Reset whenever a fresh host
+  // read lands, so a genuinely different (never-populated) list never inherits a stale "cleared" beat.
+  let justCleared = $state(false);
+  // Fires the one-time "you're done" toast the instant a tap completes the list — never again this
+  // mount, and never for a list that merely *loads* fully purchased (only doMark's own tap flips
+  // this). Reset alongside justCleared so a fresh host read re-arms it for its own completion.
+  let celebratedComplete = $state(false);
   // Suppresses the widget's inline two-tap confirm when the server's confirmGate is active.
   // Set once in onMount from window.__MCP_SERVER_CAPS__ (injected at resources/read time).
   let elicitation = $state(false);
+  // Touch hosts get an additive swipe-right-to-mark gesture alongside the tap (unlike pantry's swipe,
+  // which replaces its button — grocery's checkbox stays fully live either way). Detected the same
+  // way pantry does: the host's declared capability, falling back to a coarse-pointer media query.
+  let touchDevice = $state(false);
+  // The row past the commit threshold (the reveal's armed pop), mirroring pantry's armedUid.
+  let armedUid = $state<string | null>(null);
+  // The row mid-drag (the lift shadow), mirroring pantry's draggingUid.
+  let draggingUid = $state<string | null>(null);
 
   const DEBOUNCE_MS = 300;
   const lastTap = new Map<string, number>(); // uid -> performance.now(), for the per-row flap-guard
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Group consecutive same-aisle rows (read_grocery_list already emits store-walk order); purchased
-  // items sink to the bottom of their aisle group.
+  // items sink to the bottom of their aisle group. Defensive merge below: groupConsecutive only
+  // merges ADJACENT same-aisle runs, so an items array that ever arrives (or gets locally spliced)
+  // out of walk-order would otherwise emit two separate groups sharing one aisle name — and
+  // GroupedList's `{#each groups as group (group.key)}` requires unique keys, so that would crash
+  // the whole widget rather than just misgroup a row. Pantry avoids this by sorting before grouping;
+  // grocery can't (it depends on walk-order), so it merges by key here instead.
   const groups = $derived.by(() => {
-    const out = groupConsecutive(items, (item) => item.aisle ?? "Other");
+    const consecutive = groupConsecutive(
+      items,
+      (item) => item.aisle ?? "Other",
+    );
+    const byKey = new Map<string, { key: string; items: Row[] }>();
+    const out: { key: string; items: Row[] }[] = [];
+    for (const g of consecutive) {
+      const existing = byKey.get(g.key);
+      if (existing) existing.items.push(...g.items);
+      else {
+        const merged = { key: g.key, items: [...g.items] };
+        byKey.set(g.key, merged);
+        out.push(merged);
+      }
+    }
     for (const g of out)
       g.items.sort((a, b) => Number(a.purchased) - Number(b.purchased));
     return out;
   });
 
   const purchasedCount = $derived(items.filter((i) => i.purchased).length);
+  // Drives the header ring's conic-gradient sweep (registered as an animatable <number> below, so the
+  // browser tweens the fill natively instead of jump-cutting it).
+  const pct = $derived(
+    items.length > 0 ? (purchasedCount / items.length) * 100 : 0,
+  );
 
   onMount(() => {
     const serverCaps = (globalThis as Record<string, unknown>)[SERVER_CAPS_KEY];
@@ -77,6 +119,10 @@
       onResult: receive,
       onContext: (ctx) => {
         if (ctx?.theme) theme = ctx.theme;
+        touchDevice =
+          ctx?.deviceCapabilities?.touch ??
+          (typeof matchMedia === "function" &&
+            matchMedia("(pointer: coarse)").matches);
       },
     });
   });
@@ -103,6 +149,8 @@
     errorMsg = null;
     confirmingClear = false;
     confirmingMove = false;
+    justCleared = false;
+    celebratedComplete = false;
     phase = "ready";
   }
 
@@ -151,6 +199,15 @@
       setTimeout(() => {
         item._error = false;
       }, 1100);
+    } else if (
+      !celebratedComplete &&
+      items.every((i) => i.purchased && !i._busy)
+    ) {
+      // Rows still in flight can revert, so the moment only counts once every mark has landed.
+      // The tap that finishes the list, once — a quiet acknowledgment of the moment plus a nudge
+      // toward the two pills that just appeared, not a fireworks show over a checkbox.
+      celebratedComplete = true;
+      showToast("That’s the list — clear it or move it to pantry.", "info");
     }
   }
 
@@ -237,6 +294,7 @@
     });
     if (fresh.structuredContent) receive(fresh);
     else items = items.filter((i) => !i.purchased); // re-read unavailable: the clear succeeded, so sweep
+    justCleared = items.length === 0;
   }
 
   function onMove() {
@@ -269,7 +327,26 @@
     });
     if (fresh.structuredContent) receive(fresh);
     else items = items.filter((i) => !i.purchased); // re-read unavailable: the move succeeded, so sweep
+    justCleared = items.length === 0;
   }
+
+  // Swipe-right to mark purchased, on touch hosts only, additive to the tap (the checkbox stays live
+  // either way — unlike pantry's swipe, this never replaces the primary affordance). createSwipeAction
+  // is the pointer wiring + physics pantry's swipe-to-remove shares (armed pop + haptic, drag shadow,
+  // flick shortcut, weighted settle); only the direction, the 0..120 resistance
+  // clamp, and the commit transform are grocery-specific. commitTransform is "" (ease back to rest)
+  // rather than pantry's exit translate: the row stays in the list and sinks in place via
+  // animate:flip, so there's nothing to sweep toward. suppressClick is omitted too — the row IS the
+  // button, and onRow's tapThrottled debounce already no-ops a synthetic click landing right after
+  // commit() calls the same handler.
+  const swipe = createSwipeAction({
+    axis: "x",
+    direction: "right",
+    resist: (raw) => Math.max(0, Math.min(120, raw)),
+    armPx: 80,
+    flick: { px: 40, velocityPxMs: 0.8 },
+    commitTransform: "",
+  });
 </script>
 
 <WidgetShell dark={theme === "dark"}>
@@ -281,38 +358,61 @@
       title="Couldn’t load this list"
       desc={errorMsg ?? undefined}
     />
+  {:else if items.length === 0 && justCleared}
+    <StatusScreen
+      icon="🧺"
+      title="List’s clear"
+      desc="Nice work — ask when you’re ready to start a fresh list."
+    />
   {:else if items.length === 0}
     <StatusScreen
       icon="🧺"
       title="Nothing on this list yet"
-      desc="Add items and they’ll appear here, grouped by aisle in the order you walk the store."
+      desc="Ask to add items and they’ll appear here, grouped by aisle in the order you walk the store."
     />
   {:else}
     <header>
       <BrandMark title={listMeta?.name ?? ""} />
       <div class="head-right">
         {#if confirmingClear}
-          <span class="progress">Clear {purchasedCount} purchased?</span>
-          <PillButton variant="danger-strong" onclick={confirmClear}
-            >Clear</PillButton
-          >
-          <PillButton onclick={cancelClear}>Keep</PillButton>
+          <div class="mode" transition:fade={{ duration: motion(140) }}>
+            <span class="progress">Clear {purchasedCount} purchased?</span>
+            <PillButton variant="danger-strong" onclick={confirmClear}>
+              Clear
+            </PillButton>
+            <PillButton onclick={cancelClear}>Keep</PillButton>
+          </div>
         {:else if confirmingMove}
-          <span class="progress">Move {purchasedCount} to pantry?</span>
-          <PillButton variant="accent" onclick={confirmMove}>Move</PillButton>
-          <PillButton onclick={cancelMove}>Keep</PillButton>
+          <div class="mode" transition:fade={{ duration: motion(140) }}>
+            <span class="progress">Move {purchasedCount} to pantry?</span>
+            <PillButton variant="accent" onclick={confirmMove}>Move</PillButton>
+            <PillButton onclick={cancelMove}>Keep</PillButton>
+          </div>
         {:else}
-          <span class="progress">{purchasedCount}/{items.length} done</span>
-          {#if purchasedCount > 0}
-            <PillButton
-              variant="accent"
-              onclick={elicitation ? confirmMove : onMove}
-              >Move {purchasedCount} → pantry</PillButton
+          <div class="mode" transition:fade={{ duration: motion(140) }}>
+            <div
+              class="ring"
+              class:done={purchasedCount === items.length}
+              style:--pct={pct}
+              role="img"
+              aria-label="{purchasedCount} of {items.length} done"
             >
-            <PillButton onclick={elicitation ? confirmClear : onClear}
-              >Clear {purchasedCount}</PillButton
-            >
-          {/if}
+              <span class="ring-count" aria-hidden="true">
+                {purchasedCount}/{items.length}
+              </span>
+            </div>
+            {#if purchasedCount > 0}
+              <PillButton
+                variant="accent"
+                onclick={elicitation ? confirmMove : onMove}
+              >
+                Move {purchasedCount} → pantry
+              </PillButton>
+              <PillButton onclick={elicitation ? confirmClear : onClear}>
+                Clear {purchasedCount}
+              </PillButton>
+            {/if}
+          </div>
         {/if}
       </div>
     </header>
@@ -329,38 +429,62 @@
 </WidgetShell>
 
 {#snippet aisleHeader(group: { key: string; items: Row[] })}
-  <span class="count"
-    >{group.items.filter((i) => !i.purchased).length}/{group.items.length}</span
-  >
+  {@const remaining = group.items.filter((i) => !i.purchased).length}
+  <span class="count" class:done={remaining === 0}>
+    {remaining}/{group.items.length}
+  </span>
 {/snippet}
 
 {#snippet rowList(rowItems: Row[])}
   {#each rowItems as item (item.uid)}
-    <button
-      class="row"
-      class:done={item.purchased}
-      class:busy={item._busy}
-      class:err={item._error}
-      role="checkbox"
-      aria-checked={item.purchased}
-      onclick={() => onRow(item)}
-      animate:flip={{ duration: motion(220) }}
-    >
-      <span class="box">
-        {#if item._busy}
-          <Spinner size={15} color="var(--success)" />
-        {:else}
-          <svg viewBox="0 0 16 16" aria-hidden="true"
-            ><path class="tick" d="M3.5 8.5l3 3 6-6.5" /></svg
-          >
-        {/if}
-      </span>
-      <ItemRow
-        ingredient={item.ingredient}
-        quantity={item.quantity}
-        done={item.purchased}
-      />
-    </button>
+    <div class="row-wrap" animate:flip={{ duration: motion(220) }}>
+      {#if touchDevice && !item.purchased}
+        <!-- Revealed behind the row as it swipes right (mirrors pantry's iOS-Mail-style reveal). -->
+        <div
+          class="swipe-mark"
+          class:armed={armedUid === item.uid}
+          aria-hidden="true"
+        >
+          <span class="swipe-label">Purchased</span>
+        </div>
+      {/if}
+      <button
+        class="row"
+        class:done={item.purchased}
+        class:busy={item._busy}
+        class:err={item._error}
+        class:dragging={draggingUid === item.uid}
+        role="checkbox"
+        aria-checked={item.purchased}
+        aria-busy={item._busy}
+        onclick={() => onRow(item)}
+        use:swipe={{
+          enabled: touchDevice && !item.purchased,
+          commit: () => onRow(item),
+          drag: (on) => {
+            draggingUid = on ? item.uid : null;
+          },
+          arm: (on) => {
+            armedUid = on ? item.uid : null;
+          },
+        }}
+      >
+        <span class="box">
+          {#if item._busy}
+            <Spinner size={15} color="var(--success)" />
+          {:else}
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path class="tick" d="M3.5 8.5l3 3 6-6.5" />
+            </svg>
+          {/if}
+        </span>
+        <ItemRow
+          ingredient={item.ingredient}
+          quantity={item.quantity}
+          done={item.purchased}
+        />
+      </button>
+    </div>
   {/each}
 {/snippet}
 
@@ -369,6 +493,16 @@
 {/snippet}
 
 <style>
+  /* Registers --pct as an animatable <number> — a bare custom property can't be transitioned (the
+     browser treats it as an opaque token), so without this the ring's conic-gradient stop would jump
+     instead of sweep. Unsupported browsers (pre-2023 evergreen) just skip the animation; the ring
+     itself renders identically either way. */
+  @property --pct {
+    syntax: "<number>";
+    inherits: false;
+    initial-value: 0;
+  }
+
   header {
     display: flex;
     align-items: center;
@@ -379,17 +513,59 @@
     background: linear-gradient(var(--bg) 80%, transparent);
   }
   .head-right {
+    /* Positioning shell only — .mode carries the flex row, so the three head-right states (idle /
+       confirm-clear / confirm-move) can crossfade against each other via Svelte's block transitions
+       without the wrapper itself re-mounting. */
+    flex: none;
+  }
+  .mode {
     display: flex;
     /* baseline so the "n/n done" count reads on the same line as the pill labels beside it. */
     align-items: baseline;
     gap: 8px;
-    flex: none;
   }
   .progress {
     font-size: 12.5px;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+  }
+  /* The idle-state completion ring — a glanceable donut in place of plain "n/m" text, readable at a
+     glance while pushing a cart one-handed. --pct sweeps natively via the @property registration
+     above; the fill color hard-swaps to --success at 100% rather than crossfading, matching how the
+     row tick and the aisle/progress counts already treat "done" as a discrete state, not a gradient. */
+  .ring {
+    --pct: 0;
+    --ring-color: var(--accent);
+    flex: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: conic-gradient(
+      var(--ring-color) calc(var(--pct) * 1%),
+      var(--line) 0
+    );
+    display: grid;
+    place-items: center;
+    transition: --pct 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+  }
+  .ring.done {
+    --ring-color: var(--success);
+  }
+  .ring-count {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--bg);
+    display: grid;
+    place-items: center;
+    font-size: 8.5px;
+    font-weight: 700;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .ring.done .ring-count {
+    color: var(--success);
   }
 
   /* Trailing flavor text for the sticky aisle header (rendered through GroupedList's headerExtra
@@ -399,18 +575,84 @@
     color: var(--faint);
     font-variant-numeric: tabular-nums;
   }
+  /* A fully-checked aisle reads green — a real wayfinding cue while walking the store ("this aisle's
+     done, move on"), not decoration. Still clears its own bar: 3.93:1 in light / 7.94:1 in dark beats
+     the --faint baseline this label already ran at (3.27:1 / 4.04:1) for the same non-body caption role. */
+  .count.done {
+    color: var(--success);
+  }
+
+  /* Own stacking context, clipped: hosts the swipe-mark reveal behind the row and scopes .row's own
+     z-index locally so a scrolling row can never paint over GroupedList's sticky aisle header (same
+     technique pantry's .item-wrap uses). */
+  .row-wrap {
+    position: relative;
+    z-index: 0;
+    overflow: hidden;
+    /* A row is a fixed, known shape — this is the one property genuinely worth handing the browser a
+       render-skip hint for: on a very long list, an off-screen row's layout/paint is skipped entirely
+       until it nears the viewport. contain-intrinsic-size holds the scrollbar's math steady in the
+       meantime; it's an estimate the browser corrects once the row is actually measured, not a cap. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 44px;
+  }
+
+  /* Revealed behind the row as it swipes right (touch only). Green, not the danger red pantry's
+     swipe-to-remove uses — this is a forward/positive action, not a subtractive one. */
+  .swipe-mark {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    display: flex;
+    align-items: center;
+    padding-left: 22px;
+    background: var(--success);
+    color: var(--success-ink);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  /* The label pops as the drag crosses the commit threshold — "release does it now". CSS-driven,
+     so WidgetShell's reduced-motion block collapses the pop to an instant state change. Mirrors
+     pantry's swipe-action label pop. */
+  .swipe-label {
+    display: inline-block;
+    opacity: 0.85;
+    transition:
+      transform 0.12s cubic-bezier(0.25, 1, 0.5, 1),
+      opacity 0.12s;
+  }
+  .swipe-mark.armed .swipe-label {
+    transform: scale(1.08);
+    opacity: 1;
+  }
 
   .row {
+    position: relative;
+    z-index: 1; /* paints above .swipe-mark; its opaque bg hides the reveal until swiped */
     display: flex;
     align-items: center;
     gap: 12px;
     width: 100%;
     padding: 11px 16px;
     text-align: left;
-    transition: background 0.13s;
+    background: var(--bg);
+    touch-action: pan-y pinch-zoom;
+    transition:
+      background 0.13s,
+      transform 0.1s cubic-bezier(0.25, 1, 0.5, 1);
   }
-  .row:hover {
+  @media (hover: hover) {
+    .row:hover {
+      background: var(--hover);
+    }
+  }
+  /* Immediate tactile feedback on tap — this surface is used one-handed in a store aisle, so the
+     press has to read before the network round-trip (mark_grocery_item_purchased) resolves, not
+     after. A row press is the highest-frequency interaction here, so it earns the touch. */
+  .row:active {
     background: var(--hover);
+    transform: scale(0.985);
   }
   .row:focus-visible {
     outline-offset: -2px;
@@ -420,13 +662,23 @@
     animation: errFlash 1.1s ease-out;
   }
   @keyframes errFlash {
+    /* Opaque at rest, not transparent: on touch hosts the green swipe reveal sits behind every
+       unpurchased row and would show through. */
     0%,
     100% {
-      background: transparent;
+      background: var(--bg);
     }
     18% {
       background: var(--danger-bg);
     }
+  }
+  /* Mid-drag the row genuinely floats above the reveal, so it earns the one shadow: a soft cast
+     off its leading (left) edge onto the uncovered action — mirrors pantry's rightward-cast
+     shadow, since this row drags right instead of left. will-change only while dragging, never
+     at rest. */
+  .row.dragging {
+    will-change: transform;
+    box-shadow: -12px 0 16px -10px oklch(0 0 0 / 0.22);
   }
 
   .box {

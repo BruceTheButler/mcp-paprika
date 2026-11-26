@@ -1,5 +1,6 @@
 // The semconv-named instruments shared by more than one recording seam (the
-// tool and resource chokepoints both feed `mcp.server.operation.duration`;
+// tool and resource chokepoints and the transport wrap all feed
+// `mcp.server.operation.duration`;
 // both transports feed the session histogram). Single-seam custom counters
 // live at their seam — only the shared, spec-named ones are centralized so
 // the descriptor exists exactly once. Everything is `lazy` because the
@@ -31,6 +32,8 @@ export const mcpServerOperationDuration: () => Histogram = lazy(() =>
 
 /** Which transport served a session/operation — custom-prefixed; shared by both transports' recordings. */
 export const ATTR_MCP_PAPRIKA_TRANSPORT = "mcp_paprika.transport";
+/** How an HTTP session-adopt attempt ended (`AdoptOutcome` in src/transport/session-rehydration.ts). */
+export const ATTR_MCP_PAPRIKA_SESSION_ADOPT_OUTCOME = "mcp_paprika.session.adopt.outcome";
 
 /** MCP session lifetime, recorded once at session close; attr: `mcp_paprika.transport`. */
 export const mcpServerSessionDuration: () => Histogram = lazy(() =>

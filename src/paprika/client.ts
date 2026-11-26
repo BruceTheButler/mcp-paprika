@@ -18,7 +18,7 @@ import {
 import { errAsync, okAsync, ResultAsync } from "neverthrow";
 import type { Logger } from "pino";
 import { z } from "zod";
-import type { ZodType, ZodTypeDef } from "zod";
+import type { ZodType } from "zod";
 
 import type { Aisle } from "../domains/aisle/types.js";
 import type { GroceryIngredient } from "../domains/grocery/grocery-ingredient/types.js";
@@ -75,6 +75,12 @@ function operationFromUrl(url: string): string {
 
 // Concurrency for the N+1 recipe fetch during sync (see PaprikaClient constructor).
 const DEFAULT_RECIPE_FETCH_CONCURRENCY = 5;
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+/** True for the DOMException `fetch` rejects with when its `signal` times out or aborts. */
+function isAbortError(error: unknown): error is DOMException {
+  return error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError");
+}
 // Above this, raising concurrency trades reliability for speed against a single origin
 // (429s, breaker trips); we allow it but warn (#174).
 const RECOMMENDED_MAX_RECIPE_FETCH_CONCURRENCY = 20;
@@ -144,10 +150,10 @@ const NOT_FOUND_MESSAGE = /not found/i;
 /**
  * The per-photo read response carries a presigned `photo_url` (short-lived S3 URL)
  * for the full-resolution bytes — distinct from the catalog GET (`/photos/`), whose
- * 6-field rows carry no URL. Only `photo_url` is consumed; `.passthrough()` ignores
+ * 6-field rows carry no URL. Only `photo_url` is consumed; `.loose()` ignores
  * the rest of the echoed metadata.
  */
-const PHOTO_DOWNLOAD_SCHEMA = z.object({ photo_url: z.string().min(1) }).passthrough();
+const PHOTO_DOWNLOAD_SCHEMA = z.object({ photo_url: z.string().min(1) }).loose();
 
 function recipeToApiPayload(recipe: Readonly<Recipe>): Record<string, unknown> {
   return {
@@ -279,6 +285,7 @@ export class PaprikaClient {
   private readonly _recipesBulkhead: ReturnType<typeof bulkhead>;
   private readonly log: Logger;
   private readonly retryPolicy: RetryPolicy;
+  private readonly requestTimeoutMs: number;
   private readonly breakerPolicy: CircuitBreakerPolicy;
   private readonly resilience: IPolicy<IRetryContext, never>;
 
@@ -286,9 +293,10 @@ export class PaprikaClient {
     private readonly email: string,
     private readonly password: string,
     log?: Logger,
-    opts?: { readonly recipeFetchConcurrency?: number },
+    opts?: { readonly recipeFetchConcurrency?: number; readonly requestTimeoutMs?: number },
   ) {
     this.log = log ?? SILENT_LOG;
+    this.requestTimeoutMs = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Cold-start sync fetches recipes N+1 (listRecipes then getRecipe per recipe),
     // throttled by this bulkhead. Configurable so a large library can go faster (#174);
@@ -356,6 +364,10 @@ export class PaprikaClient {
     observeBulkhead("paprika", this._recipesBulkhead);
   }
 
+  private timeoutError(cause: DOMException): TypeError {
+    return new TypeError(`request timed out after ${this.requestTimeoutMs.toString()} ms`, { cause });
+  }
+
   authenticate(): ResultAsync<void, PaprikaClientError> {
     // One authentication attempt. Classifies failures the same way request()
     // does so the shared retry policy can tell transient blips (retry) from a
@@ -366,13 +378,18 @@ export class PaprikaClient {
         response = await fetch(AUTH_URL, {
           method: "POST",
           body: new URLSearchParams({ email: this.email, password: this.password }),
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
         });
       } catch (error) {
         // undici throws a bare TypeError for network-level failures (DNS, TCP
         // reset, TLS handshake). Mark it retryable so a transient blip at
         // startup backs off and retries instead of crashlooping the process (#158).
+        // A per-attempt timeout is the same kind of blip.
         if (error instanceof TypeError) {
           throw new NetworkRetryableError(error);
+        }
+        if (isAbortError(error)) {
+          throw new NetworkRetryableError(this.timeoutError(error));
         }
         throw error;
       }
@@ -421,18 +438,20 @@ export class PaprikaClient {
     return this.request("GET", `${API_BASE}/recipe/${uid}/`, RecipeSchema);
   }
 
-  getRecipes(uids: ReadonlyArray<string>): ResultAsync<Array<Recipe>, PaprikaClientError> {
-    // Each fetch is throttled by the bulkhead. Its execute() can only reject
-    // with something foreign (the queue is effectively unbounded), so the
-    // fromPromise + flatten keeps even that on the Result rail — the same
-    // double-Result shape as DiskCache._locked.
-    return ResultAsync.combine(
-      uids.map((uid) =>
-        ResultAsync.fromPromise(
-          this._recipesBulkhead.execute(() => this.getRecipe(uid)),
-          (e) => toClientError(e, `${API_BASE}/recipe/${uid}/`),
-        ).andThen((r) => r),
-      ),
+  /**
+   * Fetch many recipes, one independent result per UID (same order), each throttled
+   * by the recipe bulkhead. Independent on purpose: a rate-limited fetch fails only
+   * its own result, so the sync can keep every sibling that landed (#483).
+   */
+  fetchRecipes(uids: ReadonlyArray<string>): ReadonlyArray<ResultAsync<Recipe, PaprikaClientError>> {
+    // The bulkhead's execute() can only reject with something foreign (the queue is
+    // effectively unbounded), so the fromPromise + flatten keeps even that on the
+    // Result rail — the same double-Result shape as DiskCache._locked.
+    return uids.map((uid) =>
+      ResultAsync.fromPromise(
+        this._recipesBulkhead.execute(() => this.getRecipe(uid)),
+        (e) => toClientError(e, `${API_BASE}/recipe/${uid}/`),
+      ).andThen((r) => r),
     );
   }
 
@@ -724,7 +743,9 @@ export class PaprikaClient {
     const compressed = gzipSync(JSON.stringify(payload));
     const formData = new FormData();
     formData.append("data", new Blob([compressed]), dataFilename);
-    formData.append("photo_upload", new Blob([imageBytes], { type: "image/jpeg" }), imageFilename);
+    // @types/node 26 types Buffer as Buffer<ArrayBufferLike>; Blob only accepts ArrayBuffer-backed views.
+    const photoBlob = new Blob([new Uint8Array(imageBytes)], { type: "image/jpeg" });
+    formData.append("photo_upload", photoBlob, imageFilename);
     return formData;
   }
 
@@ -740,7 +761,7 @@ export class PaprikaClient {
   private request<T>(
     method: "GET" | "POST",
     url: string,
-    schema: ZodType<T, ZodTypeDef, unknown>,
+    schema: ZodType<T, unknown>,
     body?: FormData | URLSearchParams,
   ): ResultAsync<T, PaprikaClientError> {
     const execute = async (ctx: IRetryContext): Promise<T> => {
@@ -754,7 +775,8 @@ export class PaprikaClient {
         headers["Authorization"] = `Bearer ${this.token}`;
       }
 
-      const fetchInit: RequestInit = { method, headers };
+      // Per-attempt deadline: a stalled request would otherwise hang the caller forever.
+      const fetchInit: RequestInit = { method, headers, signal: AbortSignal.timeout(this.requestTimeoutMs) };
       if (body !== undefined) {
         fetchInit.body = body;
       }
@@ -769,6 +791,9 @@ export class PaprikaClient {
         // circuit-breaker treatment as 5xx HTTP responses.
         if (error instanceof TypeError) {
           throw new NetworkRetryableError(error);
+        }
+        if (isAbortError(error)) {
+          throw new NetworkRetryableError(this.timeoutError(error));
         }
         throw error;
       }

@@ -1,6 +1,6 @@
 import { ResultAsync } from "neverthrow";
 
-import type { SyncContribution } from "../../../kernel/registry.js";
+import type { SyncContribution } from "../../../kernel/sync.js";
 import type { GroceryState } from "../module.js";
 
 import { pruneOrphanCache } from "../../../paprika/sync.js";
@@ -20,9 +20,8 @@ import { pruneOrphanCache } from "../../../paprika/sync.js";
  * `warn`-level count so the drop is observable. (Historically the un-nullable schema
  * also threw on these rows, aborting the whole cycle before meals/menus could sync.)
  *
- * `core` tier — an `err` here aborts the cycle. Returns `void`
- * — the ingredient catalog has no
- * MCP resource surface and emits no `sync:complete`. NO `sweep` — the plain store
+ * `core` tier — an `err` here aborts the cycle. Returns `void`: ingredient changes
+ * aren't counted in the sync change metrics. NO `sweep` — the plain store
  * tracks no pending writes, so there is nothing to sweep; and so (unlike the
  * list/item sync factories) this one takes no `state` — its own store/cache are
  * reached through the `BootCtx` the kernel passes to `reconcile`.
@@ -47,12 +46,12 @@ export function groceryIngredientsSync(): SyncContribution<GroceryState, "aisle"
         // Such a row carries no aisle memory — add_grocery_items resolves it to "" and the
         // item then defaults to "Miscellaneous", identical to having no catalog entry at
         // all — so keeping it just bloats the catalog. (Historically the null value also
-        // aborted the whole sync cycle before meals/menus could sync.) Warn on the dropped
-        // count so the drop is observable rather than silent.
+        // aborted the whole sync cycle before meals/menus could sync.) Log the dropped
+        // count at debug: it recurs every cycle and needs no action.
         const filteredIngredients = groceryIngredients.filter((i) => i.aisleUid !== "");
         const droppedNoAisle = groceryIngredients.length - filteredIngredients.length;
         if (droppedNoAisle > 0) {
-          log.warn({ count: droppedNoAisle }, "dropped grocery ingredients with no aisle");
+          log.debug({ count: droppedNoAisle }, "dropped grocery ingredients with no aisle");
         }
 
         return cache.getAll().andThen((cachedIngredients) => {

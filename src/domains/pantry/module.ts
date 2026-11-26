@@ -7,7 +7,7 @@ import type { PantryApi, PantryCreateError } from "./api.js";
 import type { PantryItem } from "./types.js";
 
 import { DiskCache } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -39,8 +39,7 @@ export interface PantryState {
 
 /**
  * Pantry's write chokepoints (`ctx.writes`), invoked by its own update / stock /
- * delete / batch-add tools. No `resourceListChanged()` — pantry is a Data entity
- * with no MCP resource surface.
+ * delete / batch-add tools.
  */
 export interface PantryWrites {
   /**
@@ -80,8 +79,7 @@ register(
       // sibling-facing contract write grocery's move consumes via `ctx.deps.pantry`.
       //
       // The commit protocol (mark-first → cache → flush → clear-on-failure → store
-      // → notify) lives in src/entity/commit.ts; these bind pantry's slice. No
-      // resourceListChanged() — pantry has no MCP resource surface.
+      // → notify) lives in src/entity/commit.ts; these bind pantry's slice.
       const pantryFx = { finish: () => notifySyncBestEffort(infra.client, infra.log) };
       const commitPantryItem: PantryWrites["commitPantryItem"] = (saved) =>
         commitEntities(state, [deletedFlagOp(saved)], pantryFx);
@@ -123,6 +121,7 @@ register(
           clearOutOfStockPantryItemsTool,
         ],
         syncs: [pantrySync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),

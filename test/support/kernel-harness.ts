@@ -31,12 +31,15 @@ export type { SeedData } from "../fixtures/seed.js";
 type Built = Awaited<ReturnType<ErasedModule["build"]>>;
 
 function makeTestConfig(): PaprikaConfig {
-  // The modules read only `sync.{enabled,pendingWriteTtl}` (store pending-write TTL) and
-  // `features` (the discover/photo-gen gates). A cast keeps the test free of the full
+  // The modules read only `sync.{enabled,pendingWriteTtl}` (store pending-write TTL),
+  // `photos.fileRoots` (upload_recipe_photo's path source) and `features` (the
+  // discover/photo-gen gates). A cast keeps the test free of the full
   // schema — the historical test convention (cf. makeAppContext's `{} as …` casts).
   return {
     transport: "stdio",
     sync: { enabled: true, pendingWriteTtl: 60_000, interval: 60_000, recipeFetchConcurrency: 4 },
+    // The schema default: `upload_recipe_photo`'s `{ path }` source disabled.
+    photos: { fileRoots: [] },
     // `features` omitted → `config.features?.…` is undefined → embeddings + imageGen off.
   } as unknown as PaprikaConfig;
 }
@@ -159,7 +162,6 @@ interface LiveHarness {
   readonly rootWrites: unknown;
   readonly infra: Infra;
   readonly notifier: Notifier;
-  readonly resourceListChanged: ReturnType<typeof vi.fn>;
 }
 
 export interface UseKernelHarnessOptions {
@@ -214,8 +216,6 @@ export interface KernelHarness<State = unknown, Writes = unknown> {
   readonly writes: () => Writes;
   readonly infra: () => Infra;
   readonly notifier: () => Notifier;
-  /** The resource-list-changed spy on the stub notifier. */
-  readonly resourceListChanged: () => ReturnType<typeof vi.fn>;
   readonly client: () => PaprikaClient;
   /** The stub server the root module's tools/resources are registered on (e.g. to stash a session id). */
   readonly server: () => McpServer;
@@ -275,7 +275,6 @@ export function useKernelHarness<State = unknown, Writes = unknown>(
         rootWrites: root.writes ?? {},
         infra,
         notifier: stub.notifier,
-        resourceListChanged: stub.resourceListChanged,
       };
     },
     async teardown(): Promise<void> {
@@ -297,7 +296,6 @@ export function useKernelHarness<State = unknown, Writes = unknown>(
     writes: () => live().rootWrites as Writes,
     infra: () => live().infra,
     notifier: () => live().notifier,
-    resourceListChanged: () => live().resourceListChanged,
     server: () => live().server,
     client: () => live().infra.client,
   };

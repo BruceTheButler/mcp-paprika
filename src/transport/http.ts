@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Server as NodeHttpServer, ServerResponse } from "node:http";
 
-import { StreamableHTTPTransport } from "@hono/mcp";
 import { bearerAuth, mcpAuthRouter } from "@hono/mcp";
 import { serve, type ServerType } from "@hono/node-server";
 import { httpInstrumentationMiddleware } from "@hono/otel";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { context, trace } from "@opentelemetry/api";
 import {
@@ -25,31 +24,44 @@ import { buildAuthContext } from "../auth/build.js";
 import { buildAuthCaches } from "../auth/disk.js";
 import { buildAuthMetadataRouter } from "../auth/metadata.js";
 import { buildAuthRoutes, buildClientCap, buildDcrRateLimit, MAX_REGISTERED_CLIENTS } from "../auth/routes.js";
+import { requestSubject } from "../auth/subject.js";
 import { GeneratedImageStore } from "../features/generated-image-store.js";
 import { buildKernel } from "../kernel/registry.js";
-import { buildBrandedServer, buildInfraBase } from "../server/build.js";
+import { buildInfraBase } from "../server/build.js";
 import { createIndexEvents } from "../server/index-events.js";
 import { broadcastNotifier } from "../server/notifier.js";
-import { notifyFromResults, runSyncLoop } from "../server/sync-loop.js";
-import {
-  clientAttrs,
-  clientFingerprint,
-  recordClientConnection,
-  recordSessionId,
-} from "../telemetry/client-fingerprint.js";
-import { ATTR_MCP_PAPRIKA_TRANSPORT, mcpServerSessionDuration } from "../telemetry/instruments.js";
-import { getMeter, getTracer, lazy, startTimer } from "../telemetry/scope.js";
+import { runSyncLoop } from "../server/sync-loop.js";
+import { clientAttrs, clientFingerprint } from "../telemetry/client-fingerprint.js";
+import { mcpServerSessionDuration } from "../telemetry/instruments.js";
+import { recordMcpOperations } from "../telemetry/mcp-operations.js";
+import { getTracer } from "../telemetry/scope.js";
 import { ATTR_GEN_AI_TOOL_NAME, ATTR_MCP_METHOD_NAME } from "../telemetry/semconv.js";
 import { unwrapAtBoot } from "../utils/errors.js";
-import { clientAddress, peerAddress } from "./client-ip.js";
+import { clientAddress, type ClientIpSource, PEER_CLIENT_IP, peerAddress } from "./client-ip.js";
 import { buildFaviconRouter } from "./favicon.js";
+import {
+  activeSessions,
+  buildRehydration,
+  HTTP_TRANSPORT_ATTR,
+  MCP_SESSION_HEADER,
+  type Session,
+} from "./session-rehydration.js";
+import { buildSessionStore } from "./session-store.js";
 import { buildWidgetPreviewRouter } from "./widget-preview.js";
 import { buildWidgetVendorRouter } from "./widget-vendor.js";
 // Side-effect: every domain/feature module self-registers on import.
 import "../kernel/modules.generated.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
-const MCP_SESSION_HEADER = "mcp-session-id";
+declare module "hono" {
+  interface ContextVariableMap {
+    /**
+     * The token `bearerAuth` verified for this request; unset under dev-auth bypass.
+     * `@hono/mcp`'s transport reads the same key and forwards it to handlers as `extra.authInfo`.
+     */
+    auth: AuthInfo | undefined;
+  }
+}
 
 /**
  * Handle returned by `startHttp`. Extends `TransportHandle` with the
@@ -60,28 +72,11 @@ export interface HttpTransportHandle extends TransportHandle {
   readonly port: number;
 }
 
-interface Session {
-  server: McpServer;
-  transport: StreamableHTTPTransport;
-  /** Started at initialize — yields elapsed seconds for mcp.server.session.duration at close. */
-  readonly elapsedSeconds: () => number;
-}
-
-const HTTP_TRANSPORT_ATTR = { [ATTR_MCP_PAPRIKA_TRANSPORT]: "http" } as const;
-
-/** Live MCP sessions; +1 at initialize, −1 at close/eviction. HTTP-only — stdio is one session per process. */
-const activeSessions = lazy(() =>
-  getMeter().createUpDownCounter("mcp_paprika.sessions.active", {
-    description: "Currently active MCP sessions",
-    unit: "{session}",
-  }),
-);
-
 /**
  * Hono middleware factory that logs one structured record per request.
  *
  * Emits `info` for all 2xx/3xx/4xx responses and `error` for 5xx. The record
- * carries `{method, path, status, durationMs}` so operators can correlate
+ * carries `{http_method, path, http_status, duration_ms}` so operators can correlate
  * access patterns with structured log streams without parsing text.
  *
  * Exported for isolated unit testing — `startHttp` has no logger injection
@@ -103,7 +98,7 @@ const PROBE_PATHS = new Set(["/healthz"]);
  *
  * Exported for isolated unit testing, same seam as {@link accessLog}.
  */
-export function tracedRequests(trustProxy = false): MiddlewareHandler {
+export function tracedRequests(clientIp: ClientIpSource = PEER_CLIENT_IP): MiddlewareHandler {
   // Name a POST /mcp span after the JSON-RPC method the handler stashed on the
   // context (e.g. `POST /mcp tools/call`), so tool calls stand out from the
   // protocol chatter (initialize, tools/list, ping, notifications) that otherwise
@@ -126,7 +121,7 @@ export function tracedRequests(trustProxy = false): MiddlewareHandler {
       return next();
     }
     return instrument(c, async () => {
-      enrichRequestSpan(c, trustProxy);
+      enrichRequestSpan(c, clientIp);
       return next();
     });
   };
@@ -137,18 +132,18 @@ const CAPTURED_REQUEST_HEADERS = ["origin", "accept-language"];
 
 /**
  * Add the caller fingerprint @hono/otel omits to the active request span:
- * `user_agent.original`, the real `client.address` (trustProxy-aware — see
+ * `user_agent.original`, the real `client.address` (proxy-aware — see
  * {@link clientAddress}), and the socket `network.peer.address` when it differs
  * (the proxy hop). Runs INSIDE the instrument span, the same seam
  * {@link tagMcpRequestSpan} uses. Best-effort: a missing value is left unset,
  * never an error into request handling.
  */
-function enrichRequestSpan(c: Context, trustProxy: boolean): void {
+function enrichRequestSpan(c: Context, clientIp: ClientIpSource): void {
   const span = trace.getActiveSpan();
   if (span === undefined) return;
   const userAgent = c.req.header("user-agent");
   if (userAgent !== undefined) span.setAttribute(ATTR_USER_AGENT_ORIGINAL, userAgent);
-  const client = clientAddress(c, trustProxy);
+  const client = clientAddress(c, clientIp);
   if (client !== null) span.setAttribute(ATTR_CLIENT_ADDRESS, client);
   const peer = peerAddress(c);
   if (peer !== null && peer !== client) span.setAttribute(ATTR_NETWORK_PEER_ADDRESS, peer);
@@ -162,13 +157,16 @@ function enrichRequestSpan(c: Context, trustProxy: boolean): void {
  * time-to-kernel-buffer, NOT time-to-client — TCP backpressure hides the rest, which only the
  * client's Resource Timing sees. No-ops outside the node-server adapter (the in-memory test
  * transport sets no `outgoing`), and ends immediately if the body already flushed (a tiny response).
- * Registered INSIDE `tracedRequests`, so `context.active()` here is the request span.
+ * Registered INSIDE `tracedRequests`, so `context.active()` here is the request span. A request
+ * `tracedRequests` skips (a probe, the SSE `GET /mcp`) has no span to parent under, so it gets no
+ * flush span either; one would otherwise export as a parentless root on every probe.
  */
 export function tracedFlush(): MiddlewareHandler {
   return async (c, next) => {
     await next();
     const outgoing = (c.env as { outgoing?: ServerResponse }).outgoing;
     if (!outgoing || typeof outgoing.once !== "function") return;
+    if (trace.getSpan(context.active()) === undefined) return;
     const span = getTracer().startSpan("response.flush", undefined, context.active());
     let ended = false;
     const end = (): void => {
@@ -236,7 +234,13 @@ export function accessLog(log: Logger) {
       // session (and ties back to its `mcp client connected` fingerprint); absent on
       // initialize and non-/mcp routes.
       const session = c.req.header?.(MCP_SESSION_HEADER);
-      const fields = { method: c.req.method, path: c.req.path, status, durationMs, ...(session && { session }) };
+      const fields = {
+        http_method: c.req.method,
+        path: c.req.path,
+        http_status: status,
+        duration_ms: durationMs,
+        ...(session && { session }),
+      };
 
       if (status >= 500) {
         log.error(fields, "http request 5xx");
@@ -310,14 +314,7 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
     );
   };
 
-  // DNS rebinding protection: derive once at startup. The SDK's transport
-  // options for allowedHosts/allowedOrigins/enableDnsRebindingProtection carry
-  // @deprecated JSDoc in @modelcontextprotocol/sdk 1.29.0 (it suggests
-  // external middleware) but the implementation still exists and is the
-  // smallest surface for this knob. If/when the SDK removes them, swap to a
-  // Hono middleware on /mcp.
   const { allowedHosts, allowedOrigins } = config.http;
-  const dnsRebindingProtection = allowedHosts.length > 0 || allowedOrigins.length > 0;
   // The snapshot getter is invoked at notification time. Materializing the
   // current set of servers here avoids iterator invalidation during async
   // fan-out (e.g. broadcasting a logging message while a session is being
@@ -368,15 +365,30 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
 
   const log = opts._testLog ?? rootLog.child({ component: "transport-http" });
 
+  const sessionStore = unwrapAtBoot(
+    await buildSessionStore(cacheDir, rootLog.child({ component: "session-store" })),
+    "session store init",
+  );
+  const rehydration = buildRehydration({
+    kernel,
+    store: sessionStore,
+    sessions,
+    endSession,
+    log: log.child({ component: "session-rehydration" }),
+    allowedHosts,
+    allowedOrigins,
+  });
+  await rehydration.prune();
+
   // The interval loop runs its first cycle immediately (then waits), so — with
-  // buildKernel's initial cycle — startup syncs twice. notifyFromResults turns each
-  // cycle's returned results into resourceListChanged notifications, filtered to the
-  // change types with a resource surface.
-  const loop = config.sync.enabled
-    ? runSyncLoop(async () => {
-        notifyFromResults(await kernel.syncOnce(), notifier);
-      }, config.sync.interval)
-    : null;
+  // buildKernel's initial cycle — startup syncs twice. The cycle keeps the local cache
+  // warm; its results are discarded (no resource-list notification to fan out).
+  const loop =
+    config.sync.enabled && config.sync.mode !== "lazy"
+      ? runSyncLoop(async () => {
+          return (await kernel.syncOnce()).outcome;
+        }, config.sync.interval)
+      : null;
   if (loop !== null) {
     log.info({ intervalMs: config.sync.interval }, "sync engine started");
   } else {
@@ -388,7 +400,7 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
   // Request spans + HTTP server metrics: outermost, so the access log and
   // every downstream handler run inside the request span (tool spans parent
   // under it via the active context).
-  hono.use("*", tracedRequests(authContext?.config.trustProxy ?? false));
+  hono.use("*", tracedRequests(authContext?.config.clientIp ?? PEER_CLIENT_IP));
 
   // Response-flush span: inside the request span, brackets the body write the request/app spans
   // miss (both close at handler return). The only server-side view of serialize+write cost.
@@ -452,7 +464,7 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
     //    (mcpAuthRouter processes it internally; middleware added after would be bypassed).
     //    The middleware-level cap is a fast-path 429; the authoritative atomic enforcement
     //    lives inside DiskClientRegistrationStore.registerClient (same MAX_REGISTERED_CLIENTS).
-    hono.use("/register", buildDcrRateLimit({ trustProxy: auth.config.trustProxy }));
+    hono.use("/register", buildDcrRateLimit({ clientIp: auth.config.clientIp }));
     hono.use("/register", buildClientCap(authCache, MAX_REGISTERED_CLIENTS));
 
     // 3. mcpAuthRouter mounts DCR + authorize + token + revoke.
@@ -495,13 +507,18 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
     );
 
     // 5. bearerAuth guards /mcp — all unauthenticated MCP requests are rejected with 401.
-    //    verifyAccessToken throws on invalid tokens; catch and return false.
+    //    verifyAccessToken throws on invalid tokens; catch and return false. The
+    //    verified AuthInfo is kept on the context for the session subject check.
     hono.use(
       "/mcp",
       bearerAuth({
-        verifyToken: async (token: string) => {
+        verifyToken: async (token, c) => {
           try {
-            await auth.provider.verifyAccessToken(token);
+            const authInfo = await auth.provider.verifyAccessToken(token);
+            // Sessions are bound to the token's subject. A token without one would
+            // look like dev-auth bypass and match every other subjectless token.
+            if (requestSubject(authInfo) === undefined) return false;
+            c.set("auth", authInfo);
             return true;
           } catch {
             return false;
@@ -524,11 +541,21 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
     }
 
     const sessionId = c.req.header(MCP_SESSION_HEADER);
+    const subject = requestSubject(c.get("auth"));
 
     if (sessionId !== undefined) {
-      const session = sessions.get(sessionId);
-      if (!session) {
-        return c.json({ error: "Unknown session id" }, 404);
+      // A live session the subject owns, or one rebuilt from its persisted record after
+      // a restart. Anything else (unknown, expired, another subject's) is a 404.
+      const session = await rehydration.adoptOrNull(sessionId, subject, {
+        host: c.req.header("host"),
+        origin: c.req.header("origin"),
+      });
+      if (session === null) {
+        return c.json(
+          // -32001 is the code the MCP SDK's own Streamable HTTP transport sends for an unknown session.
+          { jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null },
+          404,
+        );
       }
       const response = await session.transport.handleRequest(c);
       return response ?? c.body(null, 204);
@@ -555,48 +582,30 @@ export async function startHttp(config: PaprikaConfig, opts: StartHttpOptions = 
       );
     }
 
-    // Per session: a fresh branded server with every module's tools/resources
-    // registered onto it. registerAll is pure (closures over the per-session server;
-    // the module state/deps/infra are process-wide and shared), so registering the same
-    // tools on N session servers is safe — exactly as buildMcpServer(app) was.
-    const server = buildBrandedServer();
-    kernel.registerAll(server);
-    // Capture the connection fingerprint once per session: clientInfo + the full
-    // capability tree + the requested protocol version (from the parsed initialize
-    // body, the only place the server sees it — it does not retain the negotiated
-    // value). recordClientConnection emits the connect span + census counter + the
-    // per-server stash the tool wrapper reads; we log the same fingerprint here (the
-    // transport owns the logger). oninitialized fires after the client's initialized
-    // notification, so the client reads are populated by then.
-    server.server.oninitialized = () => {
-      const fp = recordClientConnection(server.server, {
-        transport: "http",
-        protocolVersion: body.params.protocolVersion,
-        // The RAW capabilities (from the parsed initialize body) — they carry the
-        // `extensions` map (the apps/widget `io.modelcontextprotocol/ui` axis) that
-        // the SDK's getClientCapabilities() strips.
-        rawCapabilities: body.params.capabilities,
-      });
-      log.info({ client: fp }, "mcp client connected");
-    };
-    const transport = new StreamableHTTPTransport({
+    const { protocolVersion, capabilities, clientInfo } = body.params;
+    const { server, transport } = rehydration.buildSession({
       sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id) => {
-        sessions.set(id, { server, transport, elapsedSeconds: startTimer() });
-        // Stash the session id so the tool/resource span seams can tag spans with
-        // `mcp.session.id` — the cross-request grouping key for a turn's spans.
-        recordSessionId(server.server, id);
-        activeSessions().add(1, HTTP_TRANSPORT_ATTR);
+      protocolVersion,
+      rawCapabilities: capabilities,
+      subject,
+      // Awaited on purpose: this write is what lets a session survive a restart that
+      // comes right after it connects. It runs once per session, not per request.
+      onSessionReady: async (id) => {
+        const now = new Date().toISOString();
+        await rehydration.persist({
+          sessionId: id,
+          protocolVersion,
+          clientInfo: { name: clientInfo.name, version: clientInfo.version },
+          capabilities,
+          ...(subject !== undefined ? { subject } : {}),
+          createdAt: now,
+          lastSeenAt: now,
+        });
       },
-      onsessionclosed: (id) => {
-        endSession(id);
-      },
-      allowedHosts,
-      allowedOrigins,
-      enableDnsRebindingProtection: dnsRebindingProtection,
     });
 
     await server.connect(transport);
+    recordMcpOperations(transport);
     const response = await transport.handleRequest(c, body);
     return response ?? c.body(null, 204);
   });

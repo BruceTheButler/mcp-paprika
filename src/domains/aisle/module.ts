@@ -8,7 +8,7 @@ import type { AisleApi } from "./api.js";
 import type { Aisle } from "./types.js";
 
 import { DiskCache } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, upsertOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -78,12 +78,7 @@ register(
       // both pass the check before either commits.
       const catalogWriteMutex = new Mutex();
       // The commit protocol lives in src/entity/commit.ts; this binds aisle's slice.
-      // Aisle commits fire resourceListChanged even though aisles have no resource
-      // of their own: grocery-list RESOURCES resolve item aisle names through this
-      // catalog live (render-resolution), so a rename/reorder/delete
-      // changes their rendered content without any grocery entity changing.
       const aisleFx = {
-        onCommitted: () => infra.notifier.resourceListChanged(),
         finish: () => notifySyncBestEffort(infra.client, infra.log),
       };
       const commitAisles = (aisles: ReadonlyArray<Readonly<Aisle>>): ResultAsync<void, CacheError> =>
@@ -150,7 +145,6 @@ register(
         noun: "Aisle",
         state,
         save: (tombstone) => infra.client.saveAisles([tombstone]),
-        onCommitted: aisleFx.onCommitted,
         finish: aisleFx.finish,
       });
       const deleteAisle: AisleApi["deleteAisle"] = (uid) => catalogWriteMutex.runExclusive(() => deleteAisleInner(uid));
@@ -172,6 +166,7 @@ register(
         },
         tools: [listAislesTool, updateAisleTool],
         syncs: [aisleSync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),

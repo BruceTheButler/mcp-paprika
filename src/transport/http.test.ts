@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import { fromAny } from "@total-typescript/shoehorn";
@@ -7,14 +8,19 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import type { PaprikaConfig } from "../utils/config.js";
 
-import { makeOAuthClient } from "../../test/auth/__fixtures__/oauth.js";
+import { makeOAuthClient, makeOAuthToken } from "../../test/auth/__fixtures__/oauth.js";
 import { createOidcStub } from "../../test/auth/__fixtures__/oidc-stub.js";
 import { useMswServer } from "../../test/support/msw.js";
 import { failLoudOnUpstream, PAPRIKA_API_BASE, paprikaSyncMockHandlers } from "../../test/support/paprika-msw.js";
+import { installTestTelemetry } from "../../test/support/telemetry-test-utils.js";
 import { makePinoCapture, SILENT_LOGGING_CONFIG } from "../../test/support/tool-test-utils.js";
 import { useXdgIsolation } from "../../test/support/xdg-isolation.js";
 import { buildAuthCaches } from "../auth/disk.js";
+import { hashTokenForStorage } from "../auth/tokens.js";
 import { accessLog, type HttpTransportHandle, startHttp, type StartHttpOptions } from "./http.js";
+
+// Module scope, before any recording — see the helper's doc-comment.
+const telemetry = installTestTelemetry();
 
 /**
  * These tests drive the HTTP transport with raw `fetch`, not the MCP SDK
@@ -111,7 +117,7 @@ function paprikaMockHandlers() {
 // nested OAuth describe's beforeAll, which runs before the first test's outer beforeEach.
 // Note: msw's lifecycle hooks are wired by the composable; variable is used indirectly.
 void useMswServer([...paprikaMockHandlers(), ...oidcStub.handlers], {
-  onUnhandledRequest: failLoudOnUpstream,
+  onUnhandledFrame: failLoudOnUpstream,
   onReset: () => oidcStub.resetOverrides(),
 });
 const xdg = useXdgIsolation("mcp-paprika-http");
@@ -240,6 +246,28 @@ describe("HTTP transport (Streamable HTTP)", () => {
     });
   });
 
+  describe("mcp.server.operation.duration", () => {
+    it("records a fresh session's handshake and later requests", async () => {
+      const count = async (method: string): Promise<number> => {
+        const points = await telemetry.histogramPoints("mcp.server.operation.duration", {
+          "mcp.method.name": method,
+        });
+        return points.reduce((sum, point) => sum + point.value.count, 0);
+      };
+      const before = await count("initialize");
+      const handle = await startHttp(makeConfig());
+      try {
+        const sessionId = await initializeSession(handle);
+        await postJsonRpc(handle, { jsonrpc: "2.0", id: 2, method: "ping" }, sessionId);
+
+        expect(await count("initialize")).toBe(before + 1);
+        expect(await count("ping")).toBeGreaterThan(0);
+      } finally {
+        await handle.shutdown();
+      }
+    });
+  });
+
   describe("tools/list includes the expected stdio-mode tools (discover gated on vector store)", () => {
     it("contains every expected tool name", async () => {
       const handle = await startHttp(makeConfig());
@@ -333,6 +361,51 @@ describe("HTTP transport (Streamable HTTP)", () => {
     });
   });
 
+  describe("session rehydration across a restart", () => {
+    it("serves the old session id after a restart without a new initialize", async () => {
+      const first = await startHttp(makeConfig());
+      let sessionId: string;
+      try {
+        sessionId = await initializeSession(first);
+      } finally {
+        await first.shutdown();
+      }
+
+      const second = await startHttp(makeConfig());
+      try {
+        const list = await postJsonRpc(second, { jsonrpc: "2.0", id: 2, method: "tools/list" }, sessionId);
+        expect(list.status).toBe(200);
+        expect((list.result as { result?: { tools?: unknown[] } }).result?.tools?.length).toBeGreaterThan(0);
+        expect((await fetchHealth(second)).sessions).toBe(1);
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it("doesn't revive a session the client deleted", async () => {
+      const first = await startHttp(makeConfig());
+      let sessionId: string;
+      try {
+        sessionId = await initializeSession(first);
+        const del = await fetch(`http://127.0.0.1:${first.port.toString()}/mcp`, {
+          method: "DELETE",
+          headers: { accept: "application/json, text/event-stream", "mcp-session-id": sessionId },
+        });
+        expect(del.status).toBe(200);
+      } finally {
+        await first.shutdown();
+      }
+
+      const second = await startHttp(makeConfig());
+      try {
+        const list = await postJsonRpc(second, { jsonrpc: "2.0", id: 2, method: "tools/list" }, sessionId);
+        expect(list.status).toBe(404);
+      } finally {
+        await second.shutdown();
+      }
+    });
+  });
+
   describe("stale session id returns 404", () => {
     it("returns 404 for a request with an unknown mcp-session-id", async () => {
       const handle = await startHttp(makeConfig());
@@ -347,6 +420,11 @@ describe("HTTP transport (Streamable HTTP)", () => {
           body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
         });
         expect(response.status).toBe(404);
+        expect(await response.json()).toEqual({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Session not found" },
+          id: null,
+        });
       } finally {
         await handle.shutdown();
       }
@@ -850,6 +928,77 @@ describe("HTTP transport — OAuth mounted", () => {
       expect(doc["error_description"]).toContain("cap");
     });
   });
+
+  describe("Session subject check", () => {
+    /** Seeds an access token for `subject` straight into the auth cache the server reads. */
+    async function seedToken(subject: string): Promise<string> {
+      const plaintext = `test-token-${randomUUID()}`;
+      const cache = (await buildAuthCaches(join(oauthXdg.dir(), "mcp-paprika")))._unsafeUnwrap();
+      (
+        await cache.oauthTokens.put(
+          makeOAuthToken({
+            tokenHash: hashTokenForStorage(plaintext),
+            identity: { email: null, sub: subject, source: "sub" },
+          }),
+        )
+      )._unsafeUnwrap();
+      (await cache.flush())._unsafeUnwrap();
+      return plaintext;
+    }
+
+    function post(token: string, body: unknown, sessionId?: string): Promise<Response> {
+      return fetch(`http://127.0.0.1:${oauthPort.toString()}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+          ...(sessionId !== undefined ? { "mcp-session-id": sessionId } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    }
+
+    /** Initializes a session under `token` and returns its id. */
+    async function openSession(token: string): Promise<string> {
+      const init = await post(token, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "vitest", version: "0" } },
+      });
+      expect(init.status).toBe(200);
+      const sessionId = init.headers.get("mcp-session-id");
+      if (sessionId === null) throw new Error("initialize returned no mcp-session-id");
+      expect((await post(token, { jsonrpc: "2.0", method: "notifications/initialized" }, sessionId)).status).toBe(202);
+      return sessionId;
+    }
+
+    it("serves a live session to the subject that opened it", async () => {
+      const owner = await seedToken("alice");
+      const sessionId = await openSession(owner);
+
+      const res = await post(owner, { jsonrpc: "2.0", id: 2, method: "tools/list" }, sessionId);
+      expect(res.status).toBe(200);
+    });
+
+    it("404s a live session id presented under a different subject, without disclosing it exists", async () => {
+      const owner = await seedToken("alice");
+      const sessionId = await openSession(owner);
+      const stranger = await seedToken("mallory");
+
+      const res = await post(stranger, { jsonrpc: "2.0", id: 2, method: "tools/list" }, sessionId);
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found" },
+        id: null,
+      });
+
+      // The owner's session is untouched by the stranger's attempt.
+      expect((await post(owner, { jsonrpc: "2.0", id: 3, method: "tools/list" }, sessionId)).status).toBe(200);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -881,11 +1030,11 @@ describe("accessLog middleware", () => {
     expect(records).toHaveLength(1);
     const record = records[0];
     expect(record?.["level"]).toBe(30); // pino info = 30
-    expect(record?.["method"]).toBe("GET");
+    expect(record?.["http_method"]).toBe("GET");
     expect(record?.["path"]).toBe("/mcp");
-    expect(record?.["status"]).toBe(200);
-    expect(typeof record?.["durationMs"]).toBe("number");
-    expect((record?.["durationMs"] as number) >= 0).toBe(true);
+    expect(record?.["http_status"]).toBe(200);
+    expect(typeof record?.["duration_ms"]).toBe("number");
+    expect((record?.["duration_ms"] as number) >= 0).toBe(true);
     expect(record?.["msg"]).toBe("http request");
   });
 
@@ -909,9 +1058,9 @@ describe("accessLog middleware", () => {
     expect(records).toHaveLength(1);
     const record = records[0];
     expect(record?.["level"]).toBe(50); // pino error = 50
-    expect(record?.["method"]).toBe("POST");
+    expect(record?.["http_method"]).toBe("POST");
     expect(record?.["path"]).toBe("/mcp");
-    expect(record?.["status"]).toBe(500);
+    expect(record?.["http_status"]).toBe(500);
     expect(record?.["msg"]).toBe("http request 5xx");
   });
 
@@ -925,7 +1074,7 @@ describe("accessLog middleware", () => {
     expect(records).toHaveLength(1);
     const record = records[0];
     expect(record?.["level"]).toBe(30); // pino info = 30, not error (50)
-    expect(record?.["status"]).toBe(401);
+    expect(record?.["http_status"]).toBe(401);
     expect(record?.["msg"]).toBe("http request");
   });
 
@@ -961,8 +1110,8 @@ describe("accessLog middleware", () => {
 
     expect(records).toHaveLength(1);
     expect(records[0]!["path"]).toBe("/will-throw");
-    expect(records[0]!["method"]).toBe("GET");
-    expect(records[0]!["status"]).toBe(500);
+    expect(records[0]!["http_method"]).toBe("GET");
+    expect(records[0]!["http_status"]).toBe(500);
     expect(records[0]!["level"]).toBe(50); // error
   });
 });
@@ -1016,8 +1165,8 @@ describe("accessLog middleware placement — integration", () => {
       const mcpRecords = records.filter((r) => r["path"] === "/mcp");
       expect(mcpRecords.length).toBeGreaterThan(0);
       const r = mcpRecords[0]!;
-      expect(r["method"]).toBe("POST");
-      expect(r["status"]).toBe(400);
+      expect(r["http_method"]).toBe("POST");
+      expect(r["http_status"]).toBe(400);
       expect(r["level"]).toBe(30); // info; 5xx would be error (50)
     } finally {
       await handle.shutdown();
@@ -1046,10 +1195,10 @@ describe("accessLog middleware placement — integration", () => {
     const boomRecords = records.filter((r) => r["path"] === "/boom");
     expect(boomRecords).toHaveLength(1);
     const r = boomRecords[0]!;
-    expect(r["method"]).toBe("GET");
-    expect(r["status"]).toBe(500);
+    expect(r["http_method"]).toBe("GET");
+    expect(r["http_status"]).toBe(500);
     expect(r["level"]).toBe(50); // pino numeric level for error
     expect(r["msg"]).toBe("http request 5xx");
-    expect(typeof r["durationMs"]).toBe("number");
+    expect(typeof r["duration_ms"]).toBe("number");
   });
 });
