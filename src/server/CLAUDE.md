@@ -24,9 +24,9 @@ Both implementations swallow transport failures: `singleServerNotifier` silently
 
 The notifier needs the server, the server is registered after the kernel is built, and the kernel's initial sync may push a logging notification before any server exists. stdio resolves this with a `{ get, set }` `ServerRef` whose `get()` returns `undefined` until `set()` runs post-build, so an early notify silently no-ops. HTTP has no single server and uses `broadcastNotifier` over a live sessions snapshot instead. See ADR-0001.
 
-### `buildInfraBase` is the credential fast-fail, outside the kernel
+### Eager `buildInfraBase` is the credential fast-fail, outside the kernel
 
-`client.authenticate()` errs here on bad credentials and `unwrapAtBoot` aborts boot (ADR-0014 form #5); the kernel's `syncOnce` swallows everything, so a credential error would otherwise be invisible (#158). Keep authentication in `buildInfraBase`, not in a module. The transports assemble the full `Infra` from this base plus `notifier`/`config`/`indexEvents`/`generatedImageStore`, then call `buildKernel`.
+`client.authenticate()` errs here on bad credentials and `unwrapAtBoot` aborts boot (ADR-0014 form #5); the kernel's `syncOnce` swallows everything, so a credential error would otherwise be invisible (#158). In lazy mode it constructs the client without authenticating; the operation gate authenticates on first cloud use and returns a tool error on failure. The transports assemble the full `Infra` from this base plus `notifier`/`config`/`indexEvents`/`generatedImageStore`, then call `buildKernel`.
 
 ### The sync loop keeps the cache warm; it consumes no cycle results
 

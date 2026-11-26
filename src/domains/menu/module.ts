@@ -10,7 +10,7 @@ import type { MenuItem } from "./menu-item/types.js";
 import type { Menu } from "./types.js";
 
 import { DiskCache as DiskCacheImpl } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -143,6 +143,11 @@ register(
         // additive — a soft read surface must not abort core sync, so the kernel
         // runs each in its own best-effort try/catch.
         syncs: [menusSync(state), menuItemsSync(state)],
+        reload: () =>
+          ResultAsync.combine([
+            reloadStore(state.menus.cache, state.menus.store),
+            reloadStore(state.items.cache, state.items.store),
+          ]).map(() => undefined),
         flush: () => ResultAsync.combine([state.menus.cache.flush(), state.items.cache.flush()]).map(() => undefined),
       };
     }),

@@ -73,11 +73,12 @@ export async function startStdio(config: PaprikaConfig): Promise<TransportHandle
   // The interval loop runs its first cycle immediately (then waits), so — combined
   // with buildKernel's initial cycle — startup syncs twice. The cycle keeps the local
   // cache warm; its results are discarded (no resource-list notification to fan out).
-  const loop = config.sync.enabled
-    ? runSyncLoop(async () => {
-        return (await kernel.syncOnce()).outcome;
-      }, config.sync.interval)
-    : null;
+  const loop =
+    config.sync.enabled && config.sync.mode !== "lazy"
+      ? runSyncLoop(async () => {
+          return (await kernel.syncOnce()).outcome;
+        }, config.sync.interval)
+      : null;
   if (loop !== null) {
     tlog.info({ intervalMs: config.sync.interval }, "sync engine started");
   } else {

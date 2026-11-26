@@ -3,7 +3,7 @@ import type { ListResourcesCallback, ReadResourceTemplateCallback } from "@model
 
 import type { DomainCtx, DomainId } from "./registry.js";
 
-import { tracedResourceRead } from "../shared/resources.js";
+import { resourceNotFound, tracedResourceRead } from "../shared/resources.js";
 import { sessionAttrs } from "../telemetry/client-fingerprint.js";
 
 /**
@@ -97,7 +97,12 @@ export function defineResource<State, Deps extends DomainId>(
         kind,
         async (...args: Parameters<ReadResourceTemplateCallback>) => {
           log.info({ resource: kind }, "resource read");
-          return read(...args);
+          const access = ctx.infra.toolAccess;
+          if (access === undefined) return read(...args);
+          return (await access.run(() => read(...args), true, false)).match(
+            (result) => result,
+            (e) => resourceNotFound(`Cached resource unavailable: ${e.message}`),
+          );
         },
         // Tag the read span with `mcp.session.id` (span-only) so a widget's render spans —
         // parented under this read via the smuggled traceparent — group by session.

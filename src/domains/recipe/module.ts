@@ -14,7 +14,7 @@ import type { Photo } from "./photo/types.js";
 import type { Recipe } from "./types.js";
 
 import { DiskCache as DiskCacheImpl } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, commitSlices, deleteOp, sliceOps, upsertOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -390,6 +390,12 @@ register(
         ],
         resources: [recipePhotoResource],
         syncs: [recipesSync(state), categoriesSync(state), photosSync(state)],
+        reload: () =>
+          ResultAsync.combine([
+            reloadStore(state.recipe.cache, state.recipe.store),
+            reloadStore(state.category.cache, state.category.store),
+            reloadStore(state.photo.cache, state.photo.store),
+          ]).map(() => undefined),
         flush: () =>
           ResultAsync.combine([
             state.recipe.cache.flush(),

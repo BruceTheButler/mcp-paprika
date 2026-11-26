@@ -166,6 +166,13 @@ export class DiskCache<T> {
       });
   }
 
+  /** Re-read another process's durable snapshot while the shared operation lock is held. */
+  refresh(): ResultAsync<void, CacheError> {
+    this._pending.clear();
+    this._knownKeys.clear();
+    return this.init();
+  }
+
   flush(): ResultAsync<void, CacheError> {
     return this._measured("flush", () => this._locked("flush", () => this._writePending()));
   }

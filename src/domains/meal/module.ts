@@ -7,7 +7,7 @@ import type { MealApi, MealCreateError } from "./api.js";
 import type { Meal } from "./types.js";
 
 import { DiskCache as DiskCacheImpl } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -127,6 +127,7 @@ register(
           readMealPlanTool,
         ],
         syncs: [mealSync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),

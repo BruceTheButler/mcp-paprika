@@ -55,7 +55,7 @@ export interface ErasedSync {
 }
 
 /** What started a sync cycle — a telemetry label, not a behavioral input. */
-export type SyncTrigger = "boot" | "interval";
+export type SyncTrigger = "boot" | "interval" | "tool";
 
 /**
  * How a sync cycle ended, as recorded on its span and duration histogram.
@@ -68,6 +68,8 @@ export type SyncOutcome = "ok" | "core_partial" | "core_aborted" | "flush_failed
 export interface SyncCycle {
   readonly outcome: SyncOutcome;
   readonly results: ReadonlyArray<AnySyncResult>;
+  /** False when a best-effort reference/additive reconcile failed. */
+  readonly complete?: boolean;
 }
 
 const ATTR_SYNC_TRIGGER = "mcp_paprika.sync.trigger";
@@ -186,6 +188,7 @@ export function buildSyncDriver({
     // none.
     const cycleSpan = getTracer().startSpan("paprika.sync_cycle", { attributes: { [ATTR_SYNC_TRIGGER]: trigger } });
     const cycleElapsedSeconds = startTimer();
+    let complete = true;
     const finish = (outcome: SyncOutcome, results: ReadonlyArray<AnySyncResult>): SyncCycle => {
       const elapsedSeconds = cycleElapsedSeconds();
       cycleSpan.setAttribute(ATTR_SYNC_OUTCOME, outcome);
@@ -228,7 +231,7 @@ export function buildSyncDriver({
       } else {
         log.debug(fields, "sync cycle complete");
       }
-      return { outcome, results };
+      return { outcome, results, ...(!complete && { complete: false }) };
     };
     return context.with(trace.setSpan(context.active(), cycleSpan), async () => {
       const results: Array<AnySyncResult> = [];
@@ -247,6 +250,7 @@ export function buildSyncDriver({
               if (r !== undefined) results.push(r);
             },
             (err) => {
+              complete = false;
               log.warn({ err }, "reference sync failed; core sync unaffected");
             },
           );
@@ -274,6 +278,7 @@ export function buildSyncDriver({
               if (r !== undefined) results.push(r);
             },
             (err) => {
+              complete = false;
               log.warn({ err }, "additive sync failed; core sync unaffected");
             },
           );

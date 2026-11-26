@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { context, trace } from "@opentelemetry/api";
-import { ResultAsync } from "neverthrow";
+import { okAsync, ResultAsync } from "neverthrow";
 import type { Logger } from "pino";
 
 import type { CacheError } from "../cache/disk-cache.js";
@@ -15,6 +15,8 @@ import type { ToolDef, ToolSpec } from "./tool.js";
 
 import { getTracer } from "../telemetry/scope.js";
 import { errorTypeName, startOperation, tracePromise } from "../telemetry/trace-result.js";
+import { unwrapAtBoot } from "../utils/errors.js";
+import { createLazySync, type ToolAccess } from "./lazy-sync.js";
 import { buildSyncDriver } from "./sync.js";
 
 /**
@@ -90,6 +92,8 @@ export interface HasSynced {
  * a shared cache root — each module builds its own `DiskCache` under it.
  */
 export interface Infra {
+  /** Present only in lazy mode; tool wrappers acquire it before readiness guards. */
+  readonly toolAccess?: ToolAccess | undefined;
   readonly client: PaprikaClient;
   readonly cacheDir: string;
   readonly notifier: Notifier;
@@ -174,6 +178,7 @@ export interface ModuleParts<Id extends DomainId, Deps extends DomainId, State, 
   readonly syncs?: ReadonlyArray<SyncContribution<State, Deps>>;
   /** Runs once, after the initial sync cycle (see the boot-hook note above `ModuleParts`). */
   readonly onIndexReady?: (ctx: BootCtx<State, Deps>) => Promise<void>;
+  readonly reload?: () => ResultAsync<void, CacheError>;
   readonly flush?: () => ResultAsync<void, CacheError>;
 }
 
@@ -208,6 +213,7 @@ interface ErasedBuild {
   readonly resources?: ReadonlyArray<ErasedResourceDef>;
   readonly syncs?: ReadonlyArray<ErasedSync>;
   readonly onIndexReady?: (ctx: ErasedBootCtx) => Promise<void>;
+  readonly reload?: () => ResultAsync<void, CacheError>;
   readonly flush?: () => ResultAsync<void, CacheError>;
 }
 
@@ -282,6 +288,7 @@ export function defineModule<Id extends DomainId, const DepList extends Readonly
             resources: parts.resources,
             syncs: parts.syncs,
             onIndexReady: parts.onIndexReady,
+            reload: parts.reload,
             flush: parts.flush,
           };
         },
@@ -359,6 +366,7 @@ interface Built {
   readonly resources: ReadonlyArray<ErasedResourceDef> | undefined;
   readonly syncs: ReadonlyArray<ErasedSync> | undefined;
   readonly onIndexReady: ((ctx: ErasedBootCtx) => Promise<void>) | undefined;
+  readonly reload: (() => ResultAsync<void, CacheError>) | undefined;
 }
 
 /**
@@ -368,9 +376,18 @@ interface Built {
  * a per-session registrar. Defaults to the self-registered modules.
  */
 export async function buildKernel(
-  infra: Infra,
+  sourceInfra: Infra,
   modules: ReadonlyArray<ErasedModule> = registeredModules(),
 ): Promise<Kernel> {
+  // The runtime-only gate is shared by all sessions on this kernel.
+  let access: ToolAccess | undefined;
+  const infra: Infra = {
+    ...sourceInfra,
+    get toolAccess() {
+      return access;
+    },
+  };
+  const lazy = infra.config.sync.mode === "lazy";
   const order = topoSort(modules);
   const apis = new Map<string, unknown>();
   const built: Array<Built> = [];
@@ -403,26 +420,46 @@ export async function buildKernel(
   };
 
   // Phase 0 — construction (+ per-module cache hydration).
-  await inBoot(async () => {
-    for (const m of order) {
-      // async wrapper: ErasedModule.build may return a plain value or a promise.
-      const b = await tracePromise(getTracer(), `boot.build_module ${m.id}`, {}, async () =>
-        m.build(infra, depsOf(m.dependsOn)),
-      );
-      apis.set(m.id, b.api);
-      if (b.flush !== undefined) flushers.push(b.flush);
-      built.push({
-        id: m.id,
-        dependsOn: m.dependsOn,
-        state: b.state,
-        writes: b.writes,
-        tools: b.tools,
-        resources: b.resources,
-        syncs: b.syncs,
-        onIndexReady: b.onIndexReady,
-      });
-    }
-  });
+  const construct = () =>
+    inBoot(async () => {
+      for (const m of order) {
+        // async wrapper: ErasedModule.build may return a plain value or a promise.
+        const b = await tracePromise(getTracer(), `boot.build_module ${m.id}`, {}, async () =>
+          m.build(infra, depsOf(m.dependsOn)),
+        );
+        apis.set(m.id, b.api);
+        if (b.flush !== undefined) flushers.push(b.flush);
+        built.push({
+          id: m.id,
+          dependsOn: m.dependsOn,
+          state: b.state,
+          writes: b.writes,
+          tools: b.tools,
+          resources: b.resources,
+          syncs: b.syncs,
+          onIndexReady: b.onIndexReady,
+          reload: b.reload,
+        });
+      }
+    });
+
+  if (lazy) {
+    access = createLazySync({
+      cacheDir: infra.cacheDir,
+      account: infra.config.paprika.email,
+      maxAgeMs: infra.config.sync.interval,
+      writeGraceMs: infra.config.sync.pendingWriteTtl,
+      reload: () =>
+        ResultAsync.combine(built.flatMap((b) => (b.reload === undefined ? [] : [b.reload()]))).map(() => undefined),
+      authenticate: () => infra.client.authenticate(),
+      sync: () => syncOnce("tool"),
+      ready: () => ready(),
+    });
+    // Hydration itself must not race an active writer deleting/renaming records.
+    unwrapAtBoot(await access.run(construct, true, false), "shared cache construction");
+  } else {
+    await construct();
+  }
 
   const flushAll = (): ResultAsync<void, CacheError> =>
     ResultAsync.combine(flushers.map((f) => f())).map(() => undefined);
@@ -433,23 +470,23 @@ export async function buildKernel(
     log: infra.log.child({ component: "sync" }),
   });
 
-  // Boot: construct → run the INITIAL sync cycle → run the post-sync onIndexReady
-  // hook. The initial cycle gates the hook, so e.g. the vector index builds against
-  // already-synced stores. The interval loop just calls `syncOnce` repeatedly. The
-  // startup breadcrumb (#158) brackets the cycle: a failure logs `sync failed`
-  // (error) from the driver in ./sync.ts.
-  infra.log.info("running initial sync");
-  // The initial cycle's results are intentionally discarded — the interval driver
-  // re-syncs immediately to keep the cache warm, and nothing consumes a cycle's results.
-  await inBoot(async () => {
-    await syncOnce("boot");
-    // Span name kept verbatim as "boot.phase index" (pre-collapse dashboards key on it).
+  let indexReady = false;
+  const ready = async (): Promise<void> => {
+    if (indexReady) return;
     await tracePromise(getTracer(), "boot.phase index", {}, async () => {
       for (const b of built) {
         if (b.onIndexReady !== undefined) await b.onIndexReady(bootCtxOf(b));
       }
     });
-  });
+    indexReady = true;
+  };
+  if (!lazy) {
+    infra.log.info("running initial sync");
+    await inBoot(async () => {
+      await syncOnce("boot");
+      await ready();
+    });
+  }
   bootOp.end();
 
   return {
@@ -462,7 +499,17 @@ export async function buildKernel(
         if (b.resources !== undefined) for (const resource of b.resources) resource.register(ctx);
       }
     },
-    flushAll,
-    syncOnce,
+    // Lazy operations flush while holding their lease. A shutdown/diagnostic
+    // empty flush must never rewrite a stale process's recipe hash index.
+    flushAll: lazy ? () => okAsync(undefined) : flushAll,
+    syncOnce: lazy
+      ? async () => {
+          const result = await access!.run(() => undefined, true);
+          return result.match(
+            () => ({ outcome: "ok" as const, results: [] }),
+            () => ({ outcome: "core_aborted" as const, results: [] }),
+          );
+        }
+      : syncOnce,
   };
 }

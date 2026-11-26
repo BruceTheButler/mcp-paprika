@@ -31,7 +31,7 @@ Orientation:
 - The aisle and meal-type catalogs are fully manageable: new entries appear automatically when an item or meal names an unknown aisle/type; update_aisle / update_meal_type rename and reorder (meal types also recolor, built-ins included); delete_aisle refuses while items still reference the aisle, delete_meal_type proceeds (referencing meals just show no type) but refuses for the built-in types — rename those instead.
 - Meals: read_meal_plan shows what is coming up (today forward); search_meal_history recalls what you have already cooked (by recipe or by category); plan_meals schedules meals and log_cooked_meal records one you just made. When scheduling a meal or adding a menu item, link an existing recipe by its UID OR give a freeform name, never both. add_grocery_items wants an ingredient, quantity, and aisle; to shop a recipe, use add_recipe_to_grocery_list — parse its ingredient lines into items yourself, and the items carry the recipe link.
 - generate_recipe_photo (present only when image generation is configured) attaches the image and returns its photo UID by default. With attach:false it returns a preview plus a single-use token instead; pass that token to upload_recipe_photo to attach it later.
-- Data is served from a local cache kept fresh by background sync, so it can briefly lag changes made directly in the Paprika apps.`;
+- Data is served from a local cache. Depending on configuration it is refreshed in the background or on tool use when stale, so it can briefly lag changes made directly in the Paprika apps.`;
 
 /**
  * The pre-kernel bootstrap shared by both transports: build the logger, emit the
@@ -62,15 +62,17 @@ export async function buildInfraBase(
   setDiagLogTarget(pino({ ...PINO_BASE, level: logOptions.level }, primary));
   log.info({ transport: config.transport }, "mcp-paprika starting");
 
-  log.info("authenticating with paprika");
   const client = new PaprikaClient(
     config.paprika.email,
     config.paprika.password,
     log.child({ component: "paprika-client" }),
-    { recipeFetchConcurrency: config.sync.recipeFetchConcurrency },
+    { recipeFetchConcurrency: config.sync.recipeFetchConcurrency, requestTimeoutMs: config.paprika.requestTimeout },
   );
-  unwrapAtBoot(await client.authenticate(), "paprika authentication");
-  log.info("authenticated with paprika");
+  if (config.sync.mode !== "lazy") {
+    log.info("authenticating with paprika");
+    unwrapAtBoot(await client.authenticate(), "paprika authentication");
+    log.info("authenticated with paprika");
+  }
 
   return { log, client, cacheDir: getCacheDir() };
 }

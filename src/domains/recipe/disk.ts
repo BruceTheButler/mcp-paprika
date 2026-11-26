@@ -31,6 +31,11 @@ export class RecipeDiskCache extends DiskCache<Recipe> {
     });
   }
 
+  override refresh(): ResultAsync<void, CacheError> {
+    this._hashes.clear();
+    return super.refresh();
+  }
+
   override init(): ResultAsync<void, CacheError> {
     return super.init().andThen(() => this._loadHashIndex());
   }

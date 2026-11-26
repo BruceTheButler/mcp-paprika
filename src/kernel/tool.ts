@@ -308,7 +308,7 @@ export function defineTool<
         [ATTR_MCP_METHOD_NAME]: TOOLS_CALL_METHOD,
         [ATTR_GEN_AI_TOOL_NAME]: spec.name,
       } as const;
-      const gated: ErasedToolCallback = (args, extra) => {
+      const invoke: ErasedToolCallback = (args, extra) => {
         log.info({ tool: spec.name }, "tool invoked");
         // Args ride a separate debug line: per-call correlation (which UID, which
         // list) is recoverable by raising the level, without putting recipe-sized
@@ -398,6 +398,21 @@ export function defineTool<
         } catch (cause) {
           return fail(cause);
         }
+      };
+      const gated: ErasedToolCallback = (args, extra) => {
+        const access = ctx.infra.toolAccess;
+        if (access === undefined) return invoke(args, extra);
+        return access
+          .run(() => invoke(args, extra), spec.annotations.readOnlyHint === true)
+          .then((result) =>
+            result.match(
+              (value) => value,
+              (e) => ({
+                isError: true,
+                content: [{ type: "text" as const, text: `Paprika is unavailable: ${e.message}` }],
+              }),
+            ),
+          );
       };
       // Map the spec to the SDK's registerTool config explicitly: `name` is the
       // positional argument, not a config key. This is the single seam that threads

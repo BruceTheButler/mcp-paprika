@@ -8,7 +8,7 @@ import type { AisleApi } from "./api.js";
 import type { Aisle } from "./types.js";
 
 import { DiskCache } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, upsertOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -166,6 +166,7 @@ register(
         },
         tools: [listAislesTool, updateAisleTool],
         syncs: [aisleSync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),

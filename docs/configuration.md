@@ -36,6 +36,20 @@ When `MCP_TRANSPORT=http`, see [http-transport.md](http-transport.md) and
 [oauth-configuration.md](oauth-configuration.md) for the `MCP_HTTP_*`, `MCP_OIDC_*`,
 `MCP_ALLOWED_*`, and `MCP_OAUTH_*` variables.
 
+### Demand-driven sync
+
+Set `PAPRIKA_SYNC_MODE=lazy` to defer authentication and cloud sync until an actual tool call. The default `eager` retains startup and background sync. In lazy mode `PAPRIKA_SYNC_INTERVAL` is the maximum age of the last completely successful sync (default `15m`, minimum `1s`); no idle timer runs. Connection, initialization, catalog discovery and resource reads do not start a bulk sync. Resource reads use the shared disk snapshot; an individual photo read may still fetch its image from Paprika.
+
+All processes sharing a cache directory must use lazy mode and the same account. Do not run eager or older clients against that directory concurrently. A local-filesystem lease serializes cache hydration and complete tool operations, including writes. A waiting tool rechecks freshness after acquiring the lease and reloads all stores and recipe hash indexes before use. Lock acquisition gives up after about 25 seconds; abandoned locks are recoverable after two minutes. Keep the cache on a local filesystem, not a distributed store.
+
+A sync is fresh only after every reconcile and the durable flush succeed. Failed/partial syncs return an explicit tool error and do not become empty meal plans; subsequent attempts back off for 30 seconds. A local write postpones cloud reconciliation for `PAPRIKA_SYNC_PENDING_WRITE_TTL` (default `60s`) across processes, without pretending a successful cloud sync occurred. An interrupted or error-returning write requires reconciliation after that window. Read-only tools can use the last good snapshot during the propagation window after a completed write.
+
+`PAPRIKA_REQUEST_TIMEOUT` bounds each cloud request attempt, including login (default `20s`, minimum `1s`). Existing retries still apply, so an entire tool call can take longer. This does not enlarge a scheduler's independent execution budget: short-budget triggers should not depend on a potentially cold/stale cloud read.
+
+Lazy mode currently requires `EMBEDDING_MODEL` to be unset: cross-process coordination of the optional derived semantic-search index is not implemented. Ordinary recipe search and all other tools remain available. The configuration validator rejects this unsupported combination rather than silently serving a stale vector index.
+
+The private `.lazy-sync-state` file under the cache root stores successful-sync/attempt timestamps, a write-propagation checkpoint and an account digest, never credentials or recipe contents. Do not edit it during live operations. A missing marker causes a fresh sync on first use; a malformed marker fails closed and needs operator inspection.
+
 ### Logging
 
 | Variable               | Required | Default  | Description                                                                      |

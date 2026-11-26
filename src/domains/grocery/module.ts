@@ -11,7 +11,7 @@ import type { GroceryItem } from "./grocery-item/types.js";
 import type { GroceryList } from "./grocery-list/types.js";
 
 import { DiskCache as DiskCacheImpl } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -174,6 +174,12 @@ register(
         // ingredient catalog. All three are core — inside the outer try that aborts the
         // sync cycle on failure.
         syncs: [groceryListsSync(state), groceryItemsSync(state), groceryIngredientsSync()],
+        reload: () =>
+          ResultAsync.combine([
+            reloadStore(state.lists.cache, state.lists.store),
+            reloadStore(state.items.cache, state.items.store),
+            reloadStore(state.ingredients.cache, state.ingredients.store),
+          ]).map(() => undefined),
         flush: () =>
           ResultAsync.combine([
             state.lists.cache.flush(),

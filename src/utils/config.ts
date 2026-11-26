@@ -13,8 +13,10 @@ import { getConfigDir } from "./xdg.js";
 const ENV_VAR_HINTS: Readonly<Record<string, string>> = {
   "paprika.email": "PAPRIKA_EMAIL",
   "paprika.password": "PAPRIKA_PASSWORD",
+  "paprika.requestTimeout": "PAPRIKA_REQUEST_TIMEOUT",
   "sync.interval": "PAPRIKA_SYNC_INTERVAL",
   "sync.enabled": "PAPRIKA_SYNC_ENABLED",
+  "sync.mode": "PAPRIKA_SYNC_MODE",
   "sync.pendingWriteTtl": "PAPRIKA_SYNC_PENDING_WRITE_TTL",
   "sync.recipeFetchConcurrency": "PAPRIKA_SYNC_RECIPE_CONCURRENCY",
   "photos.fileRoots": "PAPRIKA_PHOTO_FILE_ROOTS",
@@ -198,11 +200,14 @@ export const paprikaConfigSchema = z
       z.object({
         email: z.string().min(1),
         password: z.string().min(1),
+        requestTimeout: durationField.pipe(z.number().min(1000, "must be at least 1s")).prefault("20s"),
       }),
     ),
     sync: z
       .object({
         enabled: booleanField.default(true),
+        // Lazy mode does no cloud work on connection; interval becomes a maximum cache age.
+        mode: z.enum(["eager", "lazy"]).default("eager"),
         // At least 1s: a zero interval would re-sync against Paprika back to back.
         interval: durationField.pipe(z.number().min(1000, "must be at least 1s")).prefault("15m"),
         // Window during which a local write is shielded from sync reconciliation
@@ -396,6 +401,17 @@ export const paprikaConfigSchema = z
       });
     }
   })
+  // Shared lazy snapshots do not yet coordinate the optional derived vector index.
+  .superRefine((cfg, ctx) => {
+    if (cfg.sync.mode === "lazy" && cfg.features?.embeddings?.model !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["sync", "mode"],
+        message:
+          "Lazy sync currently requires semantic search to be unconfigured; use eager mode with EMBEDDING_MODEL.",
+      });
+    }
+  })
   // AI feature config is independent of transport.
   .superRefine((cfg, ctx) => {
     // A model without creds would silently leave semantic search off.
@@ -486,9 +502,11 @@ export function buildEnvOverrides(env: NodeJS.ProcessEnv): Record<string, unknow
 
   if (env["PAPRIKA_EMAIL"] !== undefined) paprika["email"] = env["PAPRIKA_EMAIL"];
   if (env["PAPRIKA_PASSWORD"] !== undefined) paprika["password"] = env["PAPRIKA_PASSWORD"];
+  if (env["PAPRIKA_REQUEST_TIMEOUT"] !== undefined) paprika["requestTimeout"] = env["PAPRIKA_REQUEST_TIMEOUT"];
 
   if (env["PAPRIKA_SYNC_INTERVAL"] !== undefined) sync["interval"] = env["PAPRIKA_SYNC_INTERVAL"];
   if (env["PAPRIKA_SYNC_ENABLED"] !== undefined) sync["enabled"] = env["PAPRIKA_SYNC_ENABLED"];
+  if (env["PAPRIKA_SYNC_MODE"] !== undefined) sync["mode"] = env["PAPRIKA_SYNC_MODE"];
   if (env["PAPRIKA_SYNC_PENDING_WRITE_TTL"] !== undefined)
     sync["pendingWriteTtl"] = env["PAPRIKA_SYNC_PENDING_WRITE_TTL"];
   if (env["PAPRIKA_SYNC_RECIPE_CONCURRENCY"] !== undefined)

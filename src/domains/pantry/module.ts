@@ -7,7 +7,7 @@ import type { PantryApi, PantryCreateError } from "./api.js";
 import type { PantryItem } from "./types.js";
 
 import { DiskCache } from "../../cache/disk-cache.js";
-import { hydrateStore } from "../../cache/hydrate.js";
+import { hydrateStore, reloadStore } from "../../cache/hydrate.js";
 import { commitEntities, deletedFlagOp } from "../../entity/commit.js";
 import { defineModule, register } from "../../kernel/registry.js";
 import { notifySyncBestEffort } from "../../paprika/client.js";
@@ -121,6 +121,7 @@ register(
           clearOutOfStockPantryItemsTool,
         ],
         syncs: [pantrySync(state)],
+        reload: () => reloadStore(state.cache, state.store),
         flush: () => state.cache.flush(),
       };
     }),
